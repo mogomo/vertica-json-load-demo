@@ -170,4 +170,11 @@ load_manifest() {
     # shellcheck disable=SC1090
     . "$m"
     DATASET_DIR="$DATA_DIR/$label"
+    local t d
+    for t in $TABLE_LIST; do
+        for d in "$DATASET_DIR/$t/base" "$DATASET_DIR/$t/dose_01"; do
+            compgen -G "$d/*.$FILE_EXT" >/dev/null \
+                || die "data set '$label' is incomplete ($d has no files) — run: ./vload.sh generate --scale $label"
+        done
+    done
 }

@@ -275,7 +275,7 @@ cmd_clean() {
 
 cmd_demo() {
     local m drop=${DROP_AFTER:-0}
-    [[ -f $DATA_DIR/$SCALE_LABEL/manifest.env ]] || cmd_generate "$SCALE_ROWS"
+    [[ -f $DATA_DIR/$SCALE_LABEL/manifest.env && -d $DATA_DIR/$SCALE_LABEL/${TABLES[0]}/base ]] || cmd_generate "$SCALE_ROWS"
     for m in "${METHODS[@]}"; do
         if [[ $m == lap ]]; then
             DROP_AFTER=0; cmd_run lap; cmd_purge; DROP_AFTER=$drop
