@@ -161,6 +161,16 @@ docs/                    methods, ADABAS mapping, results, video script
   method's schema at a time. On a disk under 250 GB, set `COPY_BATCH_FILES=2` and
   `PURGE_PARALLEL=2` for the LAP method (see `vload.env.example`).
 
+## Disclaimer
+
+This repository is a demo. It is not a product of, and is not endorsed or supported by,
+Rocket Software, Vertica or any other company. The software is provided "as is", without
+warranty of any kind, as the MIT license says. Please try it on your own systems and data
+before you rely on it.
+
+Vertica, Rocket Software and all other product and company names are trademarks or registered
+trademarks of their respective owners.
+
 ## License
 
 [MIT](LICENSE)
