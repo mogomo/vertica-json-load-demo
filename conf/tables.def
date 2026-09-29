@@ -1,0 +1,197 @@
+# =============================================================================
+#  tables.def — single source of truth for the 10 ADABAS files / Vertica tables
+# =============================================================================
+#  Everything is derived from this file:
+#    * the hierarchical JSON produced by the generator (lib/gen_json.awk)
+#    * the Vertica DDL                                  (lib/schema.sh)
+#    * the COPY column mapping (JSON key -> column)     (lib/schema.sh)
+#    * the MERGE / INSERT column lists                  (lib/schema.sh)
+#
+#  Record types (pipe separated):
+#    T|<table>|<adabas_file_no>|<description>
+#    F|<table>|<json_path>|<column>|<vertica_type>|<generator>
+#
+#  <json_path> is relative to the "rec" object of the CDC record. A dot opens a
+#  nested object (ADABAS group); a numeric component opens an array
+#  (ADABAS MU = multiple-value field, PE = periodic group):
+#      name.first         -> "rec":{"name":{"first":...}}          group
+#      phone.0, phone.1   -> "rec":{"phone":[...,...]}             MU
+#      address.0.city     -> "rec":{"address":[{"city":...},...]}  PE
+#  Fields of the same group / array element must be listed contiguously.
+#
+#  Every record also carries a CDC header that is common to all tables and is
+#  not listed here:  hdr.isn, hdr.op, hdr.ts, hdr.batch  and rec.created.
+#
+#  Generators (append ?NN to make the value NULL NN% of the time):
+#    first | last | city | country | street | phone | email | code:N | bool
+#    pick:A;B;C          one of the listed values
+#    int:MIN:MAX         integer
+#    num:MIN:MAX         number with 2 decimals
+#    date:YYYY-MM-DD:N   date within N days after the given date
+#    id:PREFIX:WIDTH     business key derived from the ISN (e.g. AC000000042)
+#    ref:TABLE           ISN of a row in another table (foreign key)
+# =============================================================================
+
+# --- 1. CUSTOMER ------------------------------------------------------------
+T|customer|11|Customer master: group NAME, MU PHONE, PE ADDRESS
+F|customer|cust_no|cust_no|VARCHAR(12)|id:CU:10
+F|customer|name.first|first_name|VARCHAR(30)|first
+F|customer|name.last|last_name|VARCHAR(40)|last
+F|customer|birth_date|birth_date|DATE|date:1940-01-01:25000
+F|customer|segment|segment|CHAR(1)|pick:R;P;B;C
+F|customer|risk_score|risk_score|INT|int:1:999
+F|customer|email|email|VARCHAR(60)|email?10
+F|customer|phone.0|phone_1|VARCHAR(20)|phone
+F|customer|phone.1|phone_2|VARCHAR(20)|phone?40
+F|customer|phone.2|phone_3|VARCHAR(20)|phone?80
+F|customer|address.0.type|addr1_type|CHAR(1)|pick:H;W
+F|customer|address.0.street|addr1_street|VARCHAR(50)|street
+F|customer|address.0.city|addr1_city|VARCHAR(30)|city
+F|customer|address.0.country|addr1_country|CHAR(2)|country
+F|customer|address.1.type|addr2_type|CHAR(1)|pick:H;W?50
+F|customer|address.1.street|addr2_street|VARCHAR(50)|street?50
+F|customer|address.1.city|addr2_city|VARCHAR(30)|city?50
+F|customer|address.1.country|addr2_country|CHAR(2)|country?50
+
+# --- 2. ACCOUNT -------------------------------------------------------------
+T|account|12|Account master: group BALANCE, MU SIGNATORY
+F|account|acct_no|acct_no|VARCHAR(14)|id:AC:12
+F|account|cust_isn|cust_isn|BIGINT|ref:customer
+F|account|product|product|VARCHAR(10)|pick:CHECKING;SAVINGS;DEPOSIT;FX;PENSION
+F|account|currency|currency|CHAR(3)|pick:USD;EUR;GBP;ILS;CHF
+F|account|branch|branch|INT|int:1:450
+F|account|status|status|CHAR(1)|pick:A;A;A;A;F;C
+F|account|balance.ledger|ledger_balance|NUMERIC(15,2)|num:-5000:250000
+F|account|balance.available|available_balance|NUMERIC(15,2)|num:-5000:250000
+F|account|balance.overdraft_limit|overdraft_limit|NUMERIC(15,2)|num:0:20000
+F|account|open_date|open_date|DATE|date:1995-01-01:11000
+F|account|signatory.0|signatory_1|BIGINT|ref:customer
+F|account|signatory.1|signatory_2|BIGINT|ref:customer?70
+F|account|signatory.2|signatory_3|BIGINT|ref:customer?90
+
+# --- 3. CARD ----------------------------------------------------------------
+T|card|13|Payment cards: group LIMITS, PE TOKEN (wallet tokens)
+F|card|card_no|card_no|VARCHAR(19)|id:4580:12
+F|card|acct_isn|acct_isn|BIGINT|ref:account
+F|card|brand|brand|VARCHAR(10)|pick:VISA;MASTERCARD;AMEX;DINERS
+F|card|kind|kind|CHAR(1)|pick:D;C;P
+F|card|expiry|expiry_date|DATE|date:2026-01-01:1800
+F|card|limits.daily|daily_limit|NUMERIC(12,2)|num:500:20000
+F|card|limits.monthly|monthly_limit|NUMERIC(12,2)|num:2000:100000
+F|card|limits.atm|atm_limit|NUMERIC(12,2)|num:200:5000
+F|card|status|status|CHAR(1)|pick:A;A;A;B;L
+F|card|token.0.wallet|token1_wallet|VARCHAR(12)|pick:APPLE;GOOGLE;SAMSUNG?30
+F|card|token.0.id|token1_id|VARCHAR(16)|code:16?30
+F|card|token.1.wallet|token2_wallet|VARCHAR(12)|pick:APPLE;GOOGLE;SAMSUNG?75
+F|card|token.1.id|token2_id|VARCHAR(16)|code:16?75
+
+# --- 4. LOAN ----------------------------------------------------------------
+T|loan|14|Loans: group TERMS, PE COLLATERAL
+F|loan|loan_no|loan_no|VARCHAR(14)|id:LN:12
+F|loan|cust_isn|cust_isn|BIGINT|ref:customer
+F|loan|product|product|VARCHAR(10)|pick:MORTGAGE;AUTO;PERSONAL;BUSINESS
+F|loan|terms.principal|principal|NUMERIC(15,2)|num:5000:900000
+F|loan|terms.rate|interest_rate|NUMERIC(6,3)|num:1:15
+F|loan|terms.months|term_months|INT|int:12:360
+F|loan|outstanding|outstanding|NUMERIC(15,2)|num:0:900000
+F|loan|next_due|next_due_date|DATE|date:2026-01-01:60
+F|loan|status|status|CHAR(1)|pick:A;A;A;A;L;W
+F|loan|collateral.0.type|coll1_type|VARCHAR(10)|pick:HOUSE;CAR;DEPOSIT;STOCK?20
+F|loan|collateral.0.value|coll1_value|NUMERIC(15,2)|num:1000:1500000?20
+F|loan|collateral.1.type|coll2_type|VARCHAR(10)|pick:HOUSE;CAR;DEPOSIT;STOCK?70
+F|loan|collateral.1.value|coll2_value|NUMERIC(15,2)|num:1000:1500000?70
+
+# --- 5. PAYMENT -------------------------------------------------------------
+T|payment|15|Payment orders: groups DEBTOR / CREDITOR, MU REMITTANCE
+F|payment|pay_ref|pay_ref|VARCHAR(16)|id:PY:14
+F|payment|debtor.acct_isn|debtor_acct_isn|BIGINT|ref:account
+F|payment|debtor.name|debtor_name|VARCHAR(40)|last
+F|payment|creditor.iban|creditor_iban|VARCHAR(34)|code:22
+F|payment|creditor.name|creditor_name|VARCHAR(40)|last
+F|payment|creditor.country|creditor_country|CHAR(2)|country
+F|payment|amount|amount|NUMERIC(15,2)|num:1:50000
+F|payment|currency|currency|CHAR(3)|pick:USD;EUR;GBP;ILS;CHF
+F|payment|channel|channel|VARCHAR(8)|pick:ONLINE;MOBILE;BRANCH;SWIFT;SEPA
+F|payment|value_date|value_date|DATE|date:2023-01-01:1100
+F|payment|status|status|CHAR(1)|pick:S;S;S;P;R
+F|payment|remittance.0|remit_1|VARCHAR(35)|code:20
+F|payment|remittance.1|remit_2|VARCHAR(35)|code:20?60
+
+# --- 6. TXN -----------------------------------------------------------------
+T|txn|16|Account transactions (ledger postings): group MERCHANT
+F|txn|txn_ref|txn_ref|VARCHAR(18)|id:TX:16
+F|txn|acct_isn|acct_isn|BIGINT|ref:account
+F|txn|card_isn|card_isn|BIGINT|ref:card?40
+F|txn|type|txn_type|VARCHAR(8)|pick:POS;ATM;XFER;FEE;INT;DD
+F|txn|amount|amount|NUMERIC(15,2)|num:-8000:8000
+F|txn|currency|currency|CHAR(3)|pick:USD;EUR;GBP;ILS;CHF
+F|txn|booking_date|booking_date|DATE|date:2023-01-01:1100
+F|txn|merchant.mcc|mcc|INT|int:1000:9999?30
+F|txn|merchant.name|merchant_name|VARCHAR(40)|last?30
+F|txn|merchant.city|merchant_city|VARCHAR(30)|city?30
+F|txn|merchant.country|merchant_country|CHAR(2)|country?30
+F|txn|reversal|is_reversal|BOOLEAN|bool
+
+# --- 7. POLICY --------------------------------------------------------------
+T|policy|17|Insurance policies: group PREMIUM, PE COVERAGE, MU BENEFICIARY
+F|policy|policy_no|policy_no|VARCHAR(14)|id:PO:12
+F|policy|holder_isn|holder_isn|BIGINT|ref:customer
+F|policy|line|line_of_business|VARCHAR(8)|pick:LIFE;HEALTH;HOME;AUTO;TRAVEL
+F|policy|start_date|start_date|DATE|date:2015-01-01:4000
+F|policy|end_date|end_date|DATE|date:2026-01-01:3650
+F|policy|premium.amount|premium_amount|NUMERIC(12,2)|num:10:5000
+F|policy|premium.freq|premium_freq|CHAR(1)|pick:M;Q;Y
+F|policy|coverage.0.code|cov1_code|VARCHAR(6)|code:6
+F|policy|coverage.0.limit|cov1_limit|NUMERIC(15,2)|num:1000:2000000
+F|policy|coverage.1.code|cov2_code|VARCHAR(6)|code:6?50
+F|policy|coverage.1.limit|cov2_limit|NUMERIC(15,2)|num:1000:2000000?50
+F|policy|beneficiary.0|beneficiary_1|BIGINT|ref:customer?40
+F|policy|beneficiary.1|beneficiary_2|BIGINT|ref:customer?80
+
+# --- 8. CLAIM ---------------------------------------------------------------
+T|claim|18|Insurance claims: group INCIDENT, PE PAYOUT
+F|claim|claim_no|claim_no|VARCHAR(14)|id:CL:12
+F|claim|policy_isn|policy_isn|BIGINT|ref:policy
+F|claim|incident.date|incident_date|DATE|date:2023-01-01:1100
+F|claim|incident.city|incident_city|VARCHAR(30)|city
+F|claim|incident.cause|incident_cause|VARCHAR(10)|pick:FIRE;WATER;THEFT;ACCIDENT;ILLNESS;STORM
+F|claim|reserve|reserve_amount|NUMERIC(15,2)|num:100:500000
+F|claim|status|status|CHAR(1)|pick:O;O;R;P;C;X
+F|claim|adjuster|adjuster_id|INT|int:1:800
+F|claim|payout.0.date|payout1_date|DATE|date:2023-02-01:1100?40
+F|claim|payout.0.amount|payout1_amount|NUMERIC(15,2)|num:100:200000?40
+F|claim|payout.1.date|payout2_date|DATE|date:2023-03-01:1100?80
+F|claim|payout.1.amount|payout2_amount|NUMERIC(15,2)|num:100:200000?80
+
+# --- 9. EMPLOYEES (the classic ADABAS demo file) -----------------------------
+T|employees|19|Employees: groups FULL-NAME / FULL-ADDRESS, MU LANG, PE INCOME
+F|employees|personnel_id|personnel_id|VARCHAR(10)|id:EM:8
+F|employees|full_name.first_name|first_name|VARCHAR(30)|first
+F|employees|full_name.name|last_name|VARCHAR(40)|last
+F|employees|full_address.city|city|VARCHAR(30)|city
+F|employees|full_address.country|country|CHAR(2)|country
+F|employees|dept|dept|VARCHAR(6)|pick:SALE01;TECH05;ADMA01;FINA02;MGMT10;COMP02
+F|employees|job_title|job_title|VARCHAR(25)|pick:ANALYST;MANAGER;DEVELOPER;SECRETARY;SALESPERSON;DBA
+F|employees|birth|birth_date|DATE|date:1955-01-01:16000
+F|employees|lang.0|lang_1|CHAR(3)|pick:ENG;GER;FRE;SPA;HEB;ITA
+F|employees|lang.1|lang_2|CHAR(3)|pick:ENG;GER;FRE;SPA;HEB;ITA?50
+F|employees|income.0.curr_code|income1_curr|CHAR(3)|pick:USD;EUR;GBP;ILS
+F|employees|income.0.salary|income1_salary|NUMERIC(12,2)|num:30000:250000
+F|employees|income.0.bonus|income1_bonus|NUMERIC(12,2)|num:0:50000?30
+F|employees|income.1.curr_code|income2_curr|CHAR(3)|pick:USD;EUR;GBP;ILS?60
+F|employees|income.1.salary|income2_salary|NUMERIC(12,2)|num:25000:200000?60
+
+# --- 10. VEHICLES (the classic ADABAS demo file) -----------------------------
+T|vehicles|20|Vehicles: group MAKE-MODEL, MU SERVICE-DATE
+F|vehicles|reg_num|reg_num|VARCHAR(12)|id:VR:9
+F|vehicles|owner_isn|owner_isn|BIGINT|ref:employees
+F|vehicles|make_model.make|make|VARCHAR(15)|pick:VOLVO;TOYOTA;BMW;FORD;RENAULT;SKODA;TESLA
+F|vehicles|make_model.model|model|VARCHAR(15)|code:5
+F|vehicles|color|color|VARCHAR(10)|pick:BLACK;WHITE;RED;BLUE;GREY;SILVER
+F|vehicles|year|model_year|INT|int:2000:2026
+F|vehicles|mileage|mileage_km|INT|int:0:400000
+F|vehicles|fuel|fuel|CHAR(1)|pick:P;D;E;H
+F|vehicles|insured_value|insured_value|NUMERIC(12,2)|num:2000:150000
+F|vehicles|service_date.0|service_date_1|DATE|date:2023-01-01:1100?20
+F|vehicles|service_date.1|service_date_2|DATE|date:2023-01-01:1100?50
+F|vehicles|service_date.2|service_date_3|DATE|date:2023-01-01:1100?80

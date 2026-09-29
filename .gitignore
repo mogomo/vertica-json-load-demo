@@ -1,0 +1,6 @@
+# local settings and generated artifacts
+vload.env
+data/
+logs/
+reports/
+*.log
