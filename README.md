@@ -15,17 +15,21 @@ extra drivers. Every step prints **what** runs, **why** it's the right technique
 and **how long** it took per table and in total. It's built to be presented and recorded.
 
 ```
-▶ STEP 4.2  Optimized MERGE delta → target
-  WHAT  A single MERGE applies inserts, updates and soft deletes …
-  WHY   This meets all three optimization rules (declared key, all columns, identical values) …
+▶ STEP 3.2  Optimized MERGE delta → target                        (1B run, dose 1)
+  WHAT  A single MERGE applies inserts, updates and soft deletes (op_code='D'). …
+  WHY   This meets all three optimization rules (declared key, all columns, identical values), …
   SQL   MERGE INTO vload_merge.customer t USING vload_merge.customer_delta s ON t.isn = s.isn …
   EXPLAIN (access path):
-        +-DML DELETE …  JOIN MERGEJOIN(inputs presorted) [Semi] …
+        +-DML INSERT [Cost: 0, Rows: 0]
+        +-DML DELETE [Cost: 0, Rows: 0]
+        |  Target Projection: vload_merge.customer_super (DELETE ON CONTAINER)
+        | +---> JOIN MERGEJOIN(inputs presorted) [Semi] …
 ✔ optimized MERGE: DELETE + INSERT with a presorted merge join (no 'DML MERGE' operator, no outer join)
   table                   rows    seconds       rows/s
-  customer           1,000,000       0.93        1.08M
+  customer           1,000,000       3.57       280.0K
+  account            1,000,000       1.82       547.9K
   …
-✔ dose 1 MERGE: 10,000,000 rows in 1.02 s wall-clock (9.8M rows/s; 8.9 s of work done in parallel → 8.7x)
+✔ dose 1 MERGE: 10,000,000 rows in 3.57 s wall-clock  (2.80M rows/s; 23.26 s of work done in parallel → 6.5x)
 ```
 
 ## Quick start
@@ -99,10 +103,24 @@ executes, with its output, is kept in `logs/<scale>/<run>/`.
 
 ## Results
 
-Measured on a single-node Vertica 26.2 (22 threads, 64 GB RAM, NVMe), 10 tables in parallel.
+Measured on a single-node Vertica 26.2 (22 hardware threads, 61 GB RAM, one NVMe SSD), with
+the 10 tables loading in parallel.
 The full numbers and analysis are in [docs/RESULTS.md](docs/RESULTS.md).
 
 <!-- results:begin -->
+**1 billion rows** (10 tables × 100M), then 3 doses of 10M changes each (60% update, 10%
+delete, 30% insert):
+
+| Method | Base load (1B rows) | Base rows/s | Avg dose apply (10M changes) | Storage | Delete-vector rows |
+|---|---:|---:|---:|---:|---:|
+| Swap partitions | 17m 26s | 956K | 28.3 s | 52 GB | 0 |
+| Optimized MERGE | 17m 31s | 951K | 13.5 s | 53 GB | 17.4M |
+| Journal + Top-K LAP | 24m 18s ¹ | 686K | 13.1 s | 107 GB | 0 |
+| LAP journal purge | 28m 23s | – | – | 105 GB | 0 |
+
+All methods end with **identical data**: 100,800,000 live rows per table, same checksum.
+Generating the 1.03B JSON records (57.7 GB zstd) took 17 minutes.
+¹ loaded with `COPY_BATCH_FILES=2` to fit the disk.
 <!-- results:end -->
 
 ## Which method, when?
@@ -138,8 +156,10 @@ docs/                    methods, ADABAS mapping, results, video script
 
 - Vertica 12.x or newer (tested on 26.2) with the flex table package (`FJSONPARSER`)
 - bash ≥ 4.3, awk (mawk is fastest), zstd (or `COMPRESSION=gzip`)
-- For 1B rows: about 60 GB for the JSON, plus about 55 GB per method in Vertica (about 110 GB
-  for the LAP method). Use `--drop-after` to keep only one method's schema at a time.
+- Disk for 1B rows: about 58 GB of JSON, plus about 52 GB per method in Vertica (about 100 GB
+  for the LAP method), plus temp space while COPY sorts. Use `--drop-after` to keep only one
+  method's schema at a time. On a disk under 250 GB, set `COPY_BATCH_FILES=2` and
+  `PURGE_PARALLEL=2` for the LAP method (see `vload.env.example`).
 
 ## License
 

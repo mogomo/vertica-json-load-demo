@@ -22,7 +22,7 @@ swap_base_copy_sql() {
     local t=$1
     cat <<SQL
 CREATE TABLE ${SCHEMA}.${t}_stage LIKE ${SCHEMA}.${t} INCLUDING PROJECTIONS;
-$(sql_copy "$SCHEMA" "${t}_stage" "$t" "$DATASET_DIR/$t/base/*.$FILE_EXT" "${STREAM}_${t}")
+$(sql_copy "$SCHEMA" "${t}_stage" "$t" "$DATASET_DIR/$t/base" "${STREAM}_${t}")
 SQL
 }
 
@@ -41,7 +41,7 @@ swap_delta_copy_sql() {
     cat <<SQL
 DROP TABLE IF EXISTS ${SCHEMA}.${t}_delta;
 CREATE TABLE ${SCHEMA}.${t}_delta LIKE ${SCHEMA}.${t} INCLUDING PROJECTIONS;
-$(sql_copy "$SCHEMA" "${t}_delta" "$t" "$DATASET_DIR/$t/$DOSE_DIR/*.$FILE_EXT" "${STREAM}_${t}")
+$(sql_copy "$SCHEMA" "${t}_delta" "$t" "$DATASET_DIR/$t/$DOSE_DIR" "${STREAM}_${t}")
 SQL
 }
 
@@ -110,7 +110,7 @@ method_swap() {
         "COPY with FJSONPARSER reads all JSON files of a table in parallel (one parse thread per file). FILLER columns receive the flattened JSON keys (rec.address.0.city) and are mapped onto the relational columns." \
         "COPY is the fastest way to bring data into Vertica: it writes sorted, compressed ROS containers directly to disk, with no per-row transaction cost. Loading into a stage table keeps the fact table untouched and consistent until the data is validated and published." \
         "$(swap_base_copy_sql "$t0")"
-    w_base() { swap_base_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.base_copy"; }
+    w_base() { swap_base_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.base_copy" | sum_rows; }
     par_tables base_copy "base COPY" w_base "$STREAM"
 
     STEP=2.2; STREAM=""
@@ -131,7 +131,7 @@ method_swap() {
             "Loads this dose's CDC records (I/U/D after-images) into a delta table with the same projections as the fact table." \
             "Identical segmentation and sort order (HASH(isn) / ORDER BY isn) mean the anti-join in the next step is a local merge join with no data shuffling between nodes." \
             "$(swap_delta_copy_sql "$t0")"
-        w_delta() { swap_delta_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy"; }
+        w_delta() { swap_delta_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy" | sum_rows; }
         par_tables "dose${d}_copy" "dose $d COPY" w_delta "$STREAM"
 
         STEP=$((d + 2)).2; STREAM=""

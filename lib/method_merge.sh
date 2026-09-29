@@ -20,7 +20,7 @@ SQL
 
 merge_base_copy_sql() {
     local t=$1
-    sql_copy "$SCHEMA" "$t" "$t" "$DATASET_DIR/$t/base/*.$FILE_EXT" "${STREAM}_${t}"
+    sql_copy "$SCHEMA" "$t" "$t" "$DATASET_DIR/$t/base" "${STREAM}_${t}"
 }
 
 merge_delta_copy_sql() {
@@ -28,7 +28,7 @@ merge_delta_copy_sql() {
     cat <<SQL
 DROP TABLE IF EXISTS ${SCHEMA}.${t}_delta;
 CREATE TABLE ${SCHEMA}.${t}_delta LIKE ${SCHEMA}.${t} INCLUDING PROJECTIONS;
-$(sql_copy "$SCHEMA" "${t}_delta" "$t" "$DATASET_DIR/$t/$DOSE_DIR/*.$FILE_EXT" "${STREAM}_${t}")
+$(sql_copy "$SCHEMA" "${t}_delta" "$t" "$DATASET_DIR/$t/$DOSE_DIR" "${STREAM}_${t}")
 SQL
 }
 
@@ -72,7 +72,7 @@ method_merge() {
         "The initial load is a plain COPY into the target table. FILLER columns map the flattened JSON hierarchy onto the columns." \
         "There is nothing to match yet, so a MERGE would only add a join. COPY writes sorted, compressed containers directly: this is the fastest possible path." \
         "$(merge_base_copy_sql "$t0")"
-    w_base() { merge_base_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.base_copy"; }
+    w_base() { merge_base_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.base_copy" | sum_rows; }
     par_tables base_copy "base COPY" w_base "$STREAM"
 
     local d
@@ -85,7 +85,7 @@ method_merge() {
             "Loads this dose's CDC after-images into a delta table created LIKE the target, INCLUDING PROJECTIONS." \
             "Same segmentation (HASH(isn)) and sort order (isn) as the target, so the MERGE join is a local, presorted merge join: no sort, no hash table, no network shuffle." \
             "$(merge_delta_copy_sql "$t0")"
-        w_delta() { merge_delta_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy"; }
+        w_delta() { merge_delta_copy_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy" | sum_rows; }
         par_tables "dose${d}_copy" "dose $d COPY" w_delta "$STREAM"
 
         STEP=$((d + 2)).2

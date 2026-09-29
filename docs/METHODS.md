@@ -43,6 +43,7 @@ Why this is the fastest path into Vertica:
 | `FJSONPARSER(flatten_arrays=true)` + `FILLER` | Maps the nested JSON (groups, MU and PE arrays) onto plain relational columns in the same pass. There's no landing table and no second `INSERT … SELECT`. |
 | `REJECTED DATA AS TABLE` | Bad records go to a table you can query instead of failing the load. |
 | `STREAM NAME` | Progress shows live in `v_monitor.load_streams` (the runner's progress line uses it). |
+| `COPY_BATCH_FILES` (optional) | A single COPY sorts its whole input before writing ROS containers, so a very large load needs TEMP space close to its final size. Loading N files per COPY in consecutive statements bounds that peak, at the price of more, smaller containers for the Tuple Mover to merge. |
 
 The target is the same for every method. Tables are segmented by `HASH(isn)`, sorted by `isn`
 and partitioned by month of the immutable `created_date`.
@@ -257,6 +258,7 @@ usual. Vertica renames `<table>_super` and `<table>_topk` together with the tabl
 | Storage | 1x | 1x (+ delete vectors until purged) | about 2x (anchor + LAP) + history |
 | History of changes | no | no | yes, every version |
 | Housekeeping | none | Tuple Mover / `PURGE_TABLE` | periodic journal purge |
+| Extra disk while applying | touched partitions (stage) | delta table | none; the purge needs old + new copy of a table |
 | Readers during apply | never blocked; switch atomically at the swap | never blocked (snapshot reads); other writers wait for MERGE's X lock | never blocked |
 
 Measured results are in [`RESULTS.md`](RESULTS.md).

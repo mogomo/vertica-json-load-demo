@@ -24,6 +24,8 @@ load_config() {
     : "${SEED:=20260101}"
     : "${COPY_NODE_CLAUSE:=ON ANY NODE}"
     : "${RESOURCE_POOL:=}"
+    : "${COPY_BATCH_FILES:=0}"          # 0 = one COPY per table and stream; N = N files per COPY
+    : "${PURGE_PARALLEL:=0}"            # tables purged at the same time (0 = all)
     : "${SQL_PREVIEW_LINES:=60}"        # 0 = always print the full statement
     : "${PAUSE:=0}"
     : "${DRY_RUN:=0}"
@@ -164,6 +166,9 @@ vsql_exec() {
     return "$rc"
 }
 
+# sums the row counts printed by one or more COPY statements
+sum_rows() { awk '/^[0-9]+$/ { s += $1 } END { print s + 0 }'; }
+
 # single query, returns tuples on stdout
 vsql_query() { "$VSQL" -X -A -t -q -v ON_ERROR_STOP=1 -c "$1"; }
 
@@ -173,30 +178,35 @@ vsql_check() {
 }
 
 # ----------------------------------------------------------------- parallel
-# par_tables <step_id> <label> <worker_fn> [stream_prefix]
-#   Runs "<worker_fn> <table>" for every table concurrently. Each worker
-#   prints the number of rows it processed as the last line of stdout.
-#   Records per-table and wall-clock timing in $RESULTS_FILE.
+# par_tables <step_id> <label> <worker_fn> [stream_prefix] [max_parallel]
+#   Runs "<worker_fn> <table>" for every table, concurrently (at most
+#   max_parallel at a time; 0 = all). Each worker prints the number of rows it
+#   processed as the last line of stdout. Records per-table and wall-clock
+#   timing in $RESULTS_FILE.
 par_tables() {
-    local step=$1 label=$2 fn=$3 stream=${4:-} t start end e rc rows ms fails=0 total=0 sum_ms=0
-    local -A pids=()
+    local step=$1 label=$2 fn=$3 stream=${4:-} limit=${5:-0} t start end e rc rows ms fails=0 total=0 sum_ms=0 disp
     local tmp="$RUN_LOG_DIR/.par.$step"
-    mkdir -p "$tmp"
+    rm -rf "$tmp"; mkdir -p "$tmp"
     start=$(now_ms)
-    for t in "${TABLES[@]}"; do
-        (
-            local s e rows
-            s=$(now_ms)
-            if rows=$("$fn" "$t" | tail -n 1); then
-                e=$(now_ms); printf '%s %s %s %s\n' "${rows:-0}" $((e - s)) 0 "$e" > "$tmp/$t"
-            else
-                e=$(now_ms); printf '%s %s %s %s\n' 0 $((e - s)) 1 "$e" > "$tmp/$t"; exit 1
+    (
+        for t in "${TABLES[@]}"; do
+            (
+                s=$(now_ms)
+                if rows=$("$fn" "$t" | tail -n 1); then
+                    e=$(now_ms); printf '%s %s %s %s\n' "${rows:-0}" $((e - s)) 0 "$e" > "$tmp/$t"
+                else
+                    e=$(now_ms); printf '%s %s %s %s\n' 0 $((e - s)) 1 "$e" > "$tmp/$t"
+                fi
+            ) &
+            if (( limit > 0 )); then
+                while (( $(jobs -rp | wc -l) >= limit )); do wait -n || true; done
             fi
-        ) &
-        pids[$t]=$!
-    done
-    progress_monitor "$start" "$stream" "${pids[@]}"
-    for t in "${TABLES[@]}"; do wait "${pids[$t]}" || true; done
+        done
+        wait
+    ) &
+    disp=$!
+    progress_monitor "$start" "$stream" "$tmp" "$disp"
+    wait "$disp" || true
     end=$start     # wall-clock = last worker finished (not the monitor's poll)
     for t in "${TABLES[@]}"; do
         read -r _ _ _ e < "$tmp/$t" 2>/dev/null && (( e > end )) && end=$e
@@ -235,20 +245,17 @@ par_tables() {
 }
 
 # Live progress line while workers run. For COPY steps the rows loaded so far
-# are read from v_monitor.load_streams (by STREAM NAME prefix).
+# are read from v_monitor.load_streams (by STREAM NAME prefix, unique per run).
 progress_monitor() {
-    local start=$1 stream=$2; shift 2
-    local pids=("$@") alive p rows="" spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 el
-    while :; do
-        alive=0
-        for p in "${pids[@]}"; do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
-        (( alive == 0 )) && break
+    local start=$1 stream=$2 tmp=$3 pid=$4 rows="" spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 el done_n n=${#TABLES[@]}
+    while kill -0 "$pid" 2>/dev/null; do
         if (( IS_TTY )); then
             el=$(( $(now_ms) - start ))
+            done_n=$(find "$tmp" -type f | wc -l)
             if [[ -n $stream && $DRY_RUN != 1 && $((i % 4)) == 0 ]]; then
-                rows=$(vsql_query "SELECT COALESCE(SUM(accepted_row_count),0) FROM v_monitor.load_streams WHERE stream_name LIKE '${stream}%' AND is_executing" 2>/dev/null || echo "")
+                rows=$(vsql_query "SELECT COALESCE(SUM(accepted_row_count),0) FROM v_monitor.load_streams WHERE stream_name LIKE '${stream}%'" 2>/dev/null || echo "")
             fi
-            printf '\r  %s%s %6ss  %d/%d tables running%s%s' "$C_CYAN" "${spin:i%10:1}" "$(secs "$el")" "$alive" "${#pids[@]}" \
+            printf '\r  %s%s %6ss  %d/%d tables done%s%s' "$C_CYAN" "${spin:i%10:1}" "$(secs "$el")" "$done_n" "$n" \
                 "${rows:+  |  rows loaded: $(fmt_num "$rows")  ($(rate "$rows" "$el") rows/s)}" "$C_RESET"
             i=$((i + 1))
         fi

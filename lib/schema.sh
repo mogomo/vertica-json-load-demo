@@ -94,14 +94,36 @@ sql_copy_column_map() {
     } END { print "" }'
 }
 
-# sql_copy <schema> <target_table> <source_table_def> <file_glob> <stream_name>
+# sql_copy <schema> <target_table> <source_table_def> <data_dir> <stream_name>
+#   One COPY reads every file of <data_dir> (one parse thread per file).
+#   With COPY_BATCH_FILES=N the files are loaded by several consecutive COPY
+#   statements of N files each: every batch is sorted and committed on its own,
+#   which bounds the temp space a huge load needs (at the cost of more, smaller
+#   ROS containers for the Tuple Mover to merge).
 sql_copy() {
-    local schema=$1 target=$2 tbl=$3 glob=$4 stream=$5
+    local schema=$1 target=$2 tbl=$3 dir=$4 stream=$5 files=() i b=0 from
+    if (( ${COPY_BATCH_FILES:-0} > 0 )) && [[ -d $dir ]]; then
+        files=("$dir"/*."$FILE_EXT")
+    fi
+    if (( ${#files[@]} <= ${COPY_BATCH_FILES:-0} || ${#files[@]} == 0 )); then
+        sql_copy_stmt "$schema" "$target" "$tbl" "'${dir}/*.${FILE_EXT}' ${COPY_NODE_CLAUSE} ${COPY_FILTER}" "$stream"
+        return
+    fi
+    for (( i = 0; i < ${#files[@]}; i += COPY_BATCH_FILES )); do
+        b=$((b + 1))
+        from=$(printf "'%s' ${COPY_NODE_CLAUSE} ${COPY_FILTER},\n     " "${files[@]:i:COPY_BATCH_FILES}")
+        printf -- '-- batch %d: files %d-%d of %d\n' "$b" $((i + 1)) $(( i + COPY_BATCH_FILES < ${#files[@]} ? i + COPY_BATCH_FILES : ${#files[@]} )) ${#files[@]}
+        sql_copy_stmt "$schema" "$target" "$tbl" "${from%,*}" "${stream}_b${b}"
+    done
+}
+
+sql_copy_stmt() {
+    local schema=$1 target=$2 tbl=$3 from=$4 stream=$5
     cat <<SQL
 COPY ${schema}.${target} (
 $(sql_copy_column_map "$tbl")
 )
-FROM '${glob}' ${COPY_NODE_CLAUSE} ${COPY_FILTER}
+FROM ${from}
 PARSER FJSONPARSER(flatten_arrays = true)
 STREAM NAME '${stream}'
 REJECTED DATA AS TABLE ${schema}.${tbl}_rejects;

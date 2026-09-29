@@ -38,7 +38,7 @@ lap_setup_sql() {
 
 lap_copy_sql() {
     local t=$1 dir=$2
-    sql_copy "$SCHEMA" "$t" "$t" "$DATASET_DIR/$t/$dir/*.$FILE_EXT" "${STREAM}_${t}"
+    sql_copy "$SCHEMA" "$t" "$t" "$DATASET_DIR/$t/$dir" "${STREAM}_${t}"
 }
 
 method_lap() {
@@ -57,7 +57,7 @@ method_lap() {
         "A plain COPY into the anchor table. While loading, Vertica also computes the Top-K rows for the LAP." \
         "The same COPY speed as the other methods, plus the cost of maintaining the LAP (a second, pre-aggregated copy of the data). You pay that at load time instead of at every query." \
         "$(lap_copy_sql "$t0" base)"
-    w_base() { lap_copy_sql "$1" base | vsql_exec "$RUN_LOG_DIR/$1.base_copy"; }
+    w_base() { lap_copy_sql "$1" base | vsql_exec "$RUN_LOG_DIR/$1.base_copy" | sum_rows; }
     par_tables base_copy "base COPY" w_base "$STREAM"
 
     local d
@@ -70,7 +70,7 @@ method_lap() {
             "Updates arrive as new versions and deletes as tombstone versions (op_code='D'). They are appended with a plain COPY. That's the whole apply step." \
             "There's no delta table, join, DELETE or delete vectors. Applying a dose costs the same as loading new data, and the old versions stay available as history. The LAP picks the newest version per ISN." \
             "$(lap_copy_sql "$t0" "$DOSE_DIR")"
-        w_dose() { lap_copy_sql "$1" "$DOSE_DIR" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy"; }
+        w_dose() { lap_copy_sql "$1" "$DOSE_DIR" | vsql_exec "$RUN_LOG_DIR/$1.dose${DOSE}_copy" | sum_rows; }
         par_tables "dose${d}_copy" "dose $d COPY" w_dose "$STREAM"
     done
 
@@ -131,5 +131,5 @@ method_lap_purge() {
         "The journal grows with every dose, because old versions are hidden, not removed. Compacting every few months keeps storage and LAP maintenance small, and removes tombstones. Since the rename is atomic, queries keep working throughout." \
         "$(lap_purge_sql "$t0")"
     w_purge() { lap_purge_sql "$1" | vsql_exec "$RUN_LOG_DIR/$1.purge"; }
-    par_tables purge "journal purge" w_purge
+    par_tables purge "journal purge" w_purge "" "${PURGE_PARALLEL:-0}"
 }
