@@ -38,7 +38,7 @@ On a Vertica node (the JSON files must be readable by the server), as a user tha
 create schemas:
 
 ```bash
-git clone <this repo> && cd vertica_vload_demo
+git clone https://github.com/mogomo/vertica-json-load-demo.git && cd vertica-json-load-demo
 cp vload.env.example vload.env        # optional: connection, tuning, dose mix
 ./vload.sh check                      # vsql, database, CPUs, disk
 ./vload.sh demo --scale 10K           # generate + 3 methods + purge + validate + report  (~15 s)
