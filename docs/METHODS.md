@@ -1,7 +1,7 @@
 # The three methods
 
 All three methods load the **same JSON files** into the **same table** and must end with
-**identical current data**. `apply.sh` checks this after every method with a row count and a
+**identical current data**. `phase1.sh` checks this after every method with a row count and a
 checksum. The methods differ in how the changes (updates of existing rows and inserts of new
 ones) reach the 1-billion-row fact table.
 
@@ -9,6 +9,7 @@ ones) reach the 1-billion-row fact table.
 - [Method 1: insert-only upsert (journal + Top-K LAP)](#method-1--insert-only-upsert-journal--top-k-lap)
 - [Method 2: staging table + partition COPY/SWAP](#method-2--staging-table--partition-copyswap)
 - [Method 3: optimized MERGE](#method-3--optimized-merge)
+- [One file, many tables: parse once, fan out](#one-file-many-tables-parse-once-fan-out-phases-2-and-3)
 - [Repeatable runs: COPY_TABLE](#repeatable-runs-copy_table)
 - [Choosing a method](#choosing-a-method)
 
@@ -42,7 +43,7 @@ REJECTED DATA AS TABLE vload.txn_rejects_merge;
 | Many files | Each file is parsed by its own thread, so one COPY uses many cores (`JSON_FILES`, default = number of CPUs, at most 24). |
 | `FJSONPARSER(flatten_arrays=true)` + `FILLER` | Maps the nested JSON (the MERCHANT group, the TAG multiple-value field) onto plain columns in the same pass: no landing table, no second `INSERT … SELECT`. See [ADABAS_MAPPING.md](ADABAS_MAPPING.md). |
 | `ON ANY NODE` | On a cluster with shared storage, every node takes part in parsing. |
-| `REJECTED DATA AS TABLE` | Bad records go to a table you can query; `apply.sh` stops if there are any. |
+| `REJECTED DATA AS TABLE` | Bad records go to a table you can query; `phase1.sh` stops if there are any. |
 | `STREAM NAME` | The load shows in `v_monitor.load_streams` while it runs. |
 
 The fact table is segmented by `HASH(isn)`, sorted by `isn` and partitioned by month of the
@@ -158,7 +159,7 @@ delete vectors, and readers see the old or the new partitions, never a half-appl
 **What it costs:** the rebuild rewrites **every row of the touched partitions**, not just the
 changed ones. In this demo the updates hit the newest 5 % of the table (`HOT_PCT`), which
 spans two monthly partitions of ~28 M rows each, so ~56 M rows are rewritten to apply 1 M
-changes. Several sessions can insert into the same table at once, so `apply.sh` splits the
+changes. Several sessions can insert into the same table at once, so `phase1.sh` splits the
 rebuild into ISN slices (`REBUILD_SESSIONS`, default = half the CPUs): one session needed
 44 s for the rebuild, 11 sessions need 13 s. The method shines when changes are concentrated
 and partitions are small, and it loses when changes are spread over the whole table.
@@ -171,7 +172,7 @@ and partitions are small, and it loses when changes are spread over the whole ta
   `LIKE … INCLUDING PROJECTIONS`.
 - `SWAP_PARTITIONS_BETWEEN_TABLES` swaps the **whole key range**. If untouched partitions lie
   inside `[pmin, pmax]`, link them into the stage table first with
-  `COPY_PARTITIONS_TO_TABLE` (metadata only); `apply.sh` does this automatically.
+  `COPY_PARTITIONS_TO_TABLE` (metadata only); `phase1.sh` does this automatically.
 
 ---
 
@@ -200,7 +201,7 @@ COMMIT;
 2. `UPDATE SET` and `INSERT` list **every** column of the target.
 3. Both use the **same** source values.
 
-`apply.sh` prints the `EXPLAIN` of the MERGE on the first run:
+`phase1.sh` prints the `EXPLAIN` of the MERGE on the first run:
 
 | Plan | What you see |
 |---|---|
@@ -215,7 +216,7 @@ local, presorted merge join. The cost follows the number of changes, not the tab
 **What it costs**
 
 - An update is a delete plus an insert: every updated row leaves a **delete vector** in the
-  target (`apply.sh` reports the count). The Tuple Mover purges them over time, or run
+  target (`phase1.sh` reports the count). The Tuple Mover purges them over time, or run
   `PURGE_TABLE()`.
 - Duplicate keys in one batch make MERGE fail: compact the batch to the last image per key
   first, for example with `LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC)`.
@@ -224,9 +225,71 @@ local, presorted merge join. The cost follows the number of changes, not the tab
 
 ---
 
+## One file, many tables: parse once, fan out (phases 2 and 3)
+
+When every JSON file mixes the records of many tables, the expensive part, parsing, must
+happen **once**:
+
+| Approach | Parses | Verdict |
+|---|---|---|
+| one COPY per table over all files, unwanted records rejected | every record 10 times, plus ~9M rejected rows written per COPY | avoid |
+| one COPY per table with a `CASE` in the column list | still 10 parses, and COPY can only append: no update | avoid |
+| **one COPY into a staging table, then one MERGE per table** | **once** | used here |
+
+COPY only appends to one table, so it parses into a staging table, and the upserts are
+`MERGE INTO` statements that read their rows from it. A MERGE source can be a query: Vertica
+still uses the optimized plan as long as the three rules hold.
+
+**Phase 2: flat records** (`stg_flat`, columns of all tables side by side, partitioned by file):
+
+```sql
+COPY vload.stg_flat (
+    "hdr.file"            FILLER VARCHAR(12),  file                 AS "hdr.file",
+    "hdr.isn"             FILLER BIGINT,       isn                  AS "hdr.isn",
+    …
+    "customer.name.first" FILLER VARCHAR(30),  customer__first_name AS "customer.name.first",
+    …)
+FROM '/…/demo/phase2/*.json' PARSER FJSONPARSER(flatten_arrays = true);
+
+MERGE INTO vload.customer t
+USING (SELECT isn, op_code, change_ts, batch_id, customer__created_date AS created_date,
+              customer__cust_no AS cust_no, customer__first_name AS first_name, …
+         FROM vload.stg_flat
+        WHERE file = 'customer') s          -- partition pruning: reads one partition
+   ON t.isn = s.isn
+ WHEN MATCHED THEN UPDATE SET … every column …
+ WHEN NOT MATCHED THEN INSERT … every column …;
+```
+
+**Phase 3: nested documents** (`stg_doc`, one row per transaction, 2 slots of columns per table):
+
+```sql
+COPY vload.stg_doc FROM '/…/demo/phase3/*.json' PARSER FJSONPARSER(flatten_arrays = true);
+-- no column list: the columns are named like the keys, e.g. "customer.1.rec.name.first"
+
+MERGE INTO vload.customer t
+USING (SELECT "customer.0.hdr.isn" AS isn, …, "customer.0.rec.name.first" AS first_name, …
+         FROM vload.stg_doc WHERE "customer.0.hdr.isn" IS NOT NULL
+       UNION ALL
+       SELECT "customer.1.hdr.isn" AS isn, …, "customer.1.rec.name.first" AS first_name, …
+         FROM vload.stg_doc WHERE "customer.1.hdr.isn" IS NOT NULL) s
+   ON t.isn = s.isn
+ WHEN MATCHED THEN UPDATE SET …
+ WHEN NOT MATCHED THEN INSERT …;
+```
+
+The 10 MERGEs are independent and run in parallel sessions (`--parallel`). For arrays
+without a known maximum length, keep them as VMaps (`flatten_arrays=false,
+flatten_maps=false`, one `LONG VARBINARY` column per table) and explode them with
+`MAPITEMS(...) OVER (PARTITION BEST)` + `MAPLOOKUP`. It works, but it is much slower, and the
+exploded rows must go into a delta table first, because a MERGE that reads `MAPITEMS`
+directly does not get the optimized plan. See [RESULTS.md](RESULTS.md#phases-2-and-3-one-parse-10-parallel-merges).
+
+---
+
 ## Repeatable runs: COPY_TABLE
 
-`apply.sh` can run any number of times and every run starts from the same data. Before each
+`phase1.sh` can run any number of times and every run starts from the same data. Before each
 method it resets the method's table from the pristine copy made by `generate.sh`:
 
 ```sql

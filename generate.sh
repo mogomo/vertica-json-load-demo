@@ -9,7 +9,7 @@
 #    3. demo/changes/*.json: 1 million CDC change records (50% updates of
 #       existing rows, 50% inserts of new rows) as hierarchical ADABAS-style JSON
 #
-#  Run once; ./apply.sh can then be run as many times as you like.
+#  Run once; ./phase1.sh can then be run as many times as you like.
 #  Usage: ./generate.sh [--rows 1B] [--changes 1M] [--force] [--pause] [--no-color]
 # =============================================================================
 set -o errexit -o nounset -o pipefail
@@ -167,7 +167,7 @@ step_summary() {
               info "$(printf '%-14s %16s rows in all projections  %10s MB' "$t" "$(fmt_num "$rows")" "$(fmt_num "$mb")")"
           done
     info "$(printf '%-14s %16s records in %s files' "JSON changes" "$(fmt_num "$CHANGE_ROWS")" "$(find "$CHANGES_DIR" -name '*.json' | wc -l | tr -d ' ')")"
-    ok "done — now run ./apply.sh"
+    ok "done — now run ./phase1.sh"
 }
 
 START_ALL=$(now_ms)

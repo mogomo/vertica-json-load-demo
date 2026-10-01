@@ -1,12 +1,16 @@
 # shellcheck shell=bash
 # =============================================================================
-#  multi.sh — SQL of the multi-table phase, generated from conf/tables.def
+#  multi.sh — SQL of phases 2 and 3, generated from conf/tables.def
 # =============================================================================
 #  Tables (schema $SCHEMA):
 #    <table>_base     pristine data, never modified (txn_base = the 1B-row fact
-#                     table of the first phase, the others MULTI_ROWS rows each)
+#                     table of phase 1, the others MULTI_ROWS rows each)
 #    <table>          working copy, reset from <table>_base with COPY_TABLE
-#    <table>_delta    the JSON changes of one run, applied with an optimized MERGE
+#    stg_flat         phase 2 staging: one row per JSON record, the columns of
+#                     all 10 tables side by side, partitioned by table
+#    stg_doc          phase 3 staging: one row per JSON document (ADABAS
+#                     transaction), MAX_OCCURS slots of columns per table for
+#                     the records of that table's array
 #
 #  Every table gets the CDC envelope columns followed by its own columns:
 #    hdr.isn → isn BIGINT · hdr.op → op_code · hdr.ts → change_ts
@@ -42,9 +46,6 @@ m_col_list() {   # <table> [prefix] -> "isn, op_code, …"
 
 # rows of a table in this phase
 table_rows() { if [[ $1 == "$FACT_TABLE" ]]; then echo "$BASE_ROWS"; else echo "$MULTI_ROWS"; fi; }
-
-# directory of a table's JSON change files
-table_json_dir() { if [[ $1 == "$FACT_TABLE" ]]; then echo "$CHANGES_DIR"; else echo "$MULTI_DIR/$1"; fi; }
 
 # --------------------------------------------------------------------- DDL
 m_create_table() {   # <table>
@@ -134,33 +135,119 @@ SELECT COPY_TABLE('${SCHEMA}.$1_base', '${SCHEMA}.$1');
 SQL
 }
 
-# --------------------------------------------------------------------- COPY
-# FILLER columns receive the flattened JSON keys ("rec.address.1.city");
-# the real columns are computed from them in the same pass.
-m_copy() {   # <table> <stream name>
-    local t=$1
+# --------------------------------------------------------------------- phase 2
+# One JSON record per line; the table is named in the header and the record
+# sits under a key with the table's name:
+#   {"hdr":{"file":"customer","isn":…,"op":"U","ts":…,"batch":1},"customer":{…}}
+# Columns of stg_flat: file + the envelope + <table>__<column> for every table.
+sql_flat_create() {
+    local t
+    echo "DROP TABLE IF EXISTS ${SCHEMA}.stg_flat CASCADE;"
+    echo "CREATE TABLE ${SCHEMA}.stg_flat ("
+    echo "    file               VARCHAR(12) NOT NULL,"
+    defs_columns "$FACT_TABLE" | awk -F'|' '$1 ~ /^hdr\./ { t = $3; sub(/ NOT NULL$/, "", t); printf "    %-18s %s,\n", $2, t }'
+    for t in "${TABLES[@]}"; do
+        defs_columns "$t" | awk -F'|' -v t="$t" '$1 !~ /^hdr\./ { ty = $3; sub(/ NOT NULL$/, "", ty); printf "    %-40s %s,\n", t "__" $2, ty }'
+    done | sed '$ s/,$//'
     cat <<SQL
-CREATE TABLE ${SCHEMA}.${t}_delta LIKE ${SCHEMA}.${t} INCLUDING PROJECTIONS;
-COPY ${SCHEMA}.${t}_delta (
-$(defs_columns "$t" | awk -F'|' '{
-    type = $3; sub(/ NOT NULL$/, "", type)
-    printf "%s    %-30s FILLER %-15s %-18s AS %s", (NR>1?",\n":""), "\"" $1 "\"", type ",", $2, "\"" $1 "\""
-} END { print "" }')
 )
-FROM '$(table_json_dir "$t")/*.json' ${COPY_NODE_CLAUSE}
-PARSER FJSONPARSER(flatten_arrays = true)
-STREAM NAME '$2'
-REJECTED DATA AS TABLE ${SCHEMA}.${t}_rejects;
+ORDER BY file, isn
+SEGMENTED BY HASH(isn) ALL NODES
+PARTITION BY file;
 SQL
 }
 
-# --------------------------------------------------------------------- MERGE
-# Optimized MERGE: declared key, every column in UPDATE SET and INSERT, same values
-m_merge() {   # <table>
+sql_flat_copy() {   # <stream name>
+    local t
+    echo "COPY ${SCHEMA}.stg_flat ("
+    {
+        printf '    %-34s FILLER %-15s %-40s AS %s' '"hdr.file"' 'VARCHAR(12),' 'file' '"hdr.file"'
+        defs_columns "$FACT_TABLE" | awk -F'|' '$1 ~ /^hdr\./ { ty = $3; sub(/ NOT NULL$/, "", ty)
+            printf ",\n    %-34s FILLER %-15s %-40s AS %s", "\"" $1 "\"", ty ",", $2, "\"" $1 "\"" }'
+        for t in "${TABLES[@]}"; do
+            defs_columns "$t" | awk -F'|' -v t="$t" '$1 !~ /^hdr\./ { ty = $3; sub(/ NOT NULL$/, "", ty); k = $1; sub(/^rec\./, t ".", k)
+                printf ",\n    %-34s FILLER %-15s %-40s AS %s", "\"" k "\"", ty ",", t "__" $2, "\"" k "\"" }'
+        done
+        echo
+    }
+    cat <<SQL
+)
+FROM '${PHASE2_DIR}/*.json' ${COPY_NODE_CLAUSE}
+PARSER FJSONPARSER(flatten_arrays = true)
+STREAM NAME '$1'
+REJECTED DATA AS TABLE ${SCHEMA}.stg_flat_rejects;
+SQL
+}
+
+sql_flat_source() {   # <table> : the table's rows, with its own column names
     local t=$1
+    printf 'SELECT %s\n  FROM %s.stg_flat\n WHERE file = '"'"'%s'"'" \
+        "$(defs_columns "$t" | awk -F'|' -v t="$t" '{ c = ($1 ~ /^hdr\./) ? $2 : t "__" $2 " AS " $2; printf "%s%s", (NR > 1 ? ", " : ""), c }')" "$SCHEMA" "$t"
+}
+
+# --------------------------------------------------------------------- phase 3
+# One JSON document per line: an ADABAS transaction (ET) with the changed
+# records of several files, as one array per file:
+#   {"et_id":…,"et_ts":…,"customer":[{"hdr":{…},"rec":{…}},…],"account":[…],…}
+# FJSONPARSER(flatten_arrays=true) flattens the arrays too: the 2nd customer
+# record of a document arrives as "customer.1.hdr.isn", "customer.1.rec.name.first"…
+# stg_doc has MAX_OCCURS slots of columns per table, named exactly like those
+# keys, so no column list is needed. A table's rows are the UNION ALL of its
+# slots. (A record beyond MAX_OCCURS would be an unmatched key; the check after
+# the MERGEs would then find missing rows.)
+doc_slot_cols() {   # <table> <slot> -> "json_key|column|type" lines for that slot
+    defs_columns "$1" | awk -F'|' -v t="$1" -v o="$2" '{ ty = $3; sub(/ NOT NULL$/, "", ty); print t "." o "." $1 "|" $2 "|" ty }'
+}
+
+sql_doc_create() {
+    local t o
+    echo "DROP TABLE IF EXISTS ${SCHEMA}.stg_doc CASCADE;"
+    echo "CREATE TABLE ${SCHEMA}.stg_doc ("
+    echo "    et_id INT NOT NULL,"
+    echo "    et_ts TIMESTAMP,"
+    for t in "${TABLES[@]}"; do
+        for (( o = 0; o < MAX_OCCURS; o++ )); do
+            doc_slot_cols "$t" "$o" | awk -F'|' '{ printf "    %-44s %s,\n", "\"" $1 "\"", $3 }'
+        done
+    done | sed '$ s/,$//'
+    cat <<SQL
+)
+ORDER BY et_id
+SEGMENTED BY HASH(et_id) ALL NODES;
+SQL
+}
+
+sql_doc_copy() {   # <stream name>
+    cat <<SQL
+COPY ${SCHEMA}.stg_doc
+FROM '${PHASE3_DIR}/*.json' ${COPY_NODE_CLAUSE}
+PARSER FJSONPARSER(flatten_arrays = true)
+STREAM NAME '$1'
+REJECTED DATA AS TABLE ${SCHEMA}.stg_doc_rejects;
+SQL
+}
+
+sql_doc_source() {   # <table> : the table's records = UNION ALL of its slots
+    local t=$1 o out=""
+    for (( o = 0; o < MAX_OCCURS; o++ )); do
+        out+="${out:+$'\nUNION ALL\n'}SELECT $(doc_slot_cols "$t" "$o" | awk -F'|' '{ printf "%s\"%s\" AS %s", (NR > 1 ? ", " : ""), $1, $2 }')
+  FROM ${SCHEMA}.stg_doc
+ WHERE \"${t}.${o}.hdr.isn\" IS NOT NULL"
+    done
+    printf '%s' "$out"
+}
+
+# --------------------------------------------------------------------- MERGE
+# Optimized MERGE: declared key, every column in UPDATE SET and INSERT, same
+# values. The source is a query on the staging table.
+m_merge() {   # <table> <source query | table>
+    local t=$1 src
+    if [[ $2 == SELECT* ]]; then src="(
+$(printf '%s\n' "$2" | sed 's/^/    /')
+)"; else src=$2; fi
     cat <<SQL
 MERGE INTO ${SCHEMA}.${t} t
-USING ${SCHEMA}.${t}_delta s
+USING ${src} s
    ON t.isn = s.isn
  WHEN MATCHED THEN UPDATE SET
 $(defs_columns "$t" | awk -F'|' '{printf "%s    %s = s.%s", (NR>1?",\n":""), $2, $2} END{print ""}')
@@ -172,14 +259,14 @@ SQL
 
 # --------------------------------------------------------------------- check
 # rows in the table · rows of this batch · checksum of the batch rows in the
-# table · checksum of the JSON rows (delta) → the last two must be equal
-m_check() {   # <table>
+# table · checksum of the source rows → the last two must be equal
+m_check() {   # <table> <source query>
     local t=$1 h
     h="SUM(HASH($(m_col_list "$t")) % 1000000007)"
     cat <<SQL
 SELECT (SELECT COUNT(*) FROM ${SCHEMA}.${t}),
        (SELECT COUNT(*) FROM ${SCHEMA}.${t} WHERE batch_id = 1),
        (SELECT ${h} FROM ${SCHEMA}.${t} WHERE batch_id = 1),
-       (SELECT ${h} FROM ${SCHEMA}.${t}_delta);
+       (SELECT ${h} FROM $(if [[ $2 == SELECT* ]]; then printf '(\n%s\n       ) src' "$(printf '%s\n' "$2" | sed 's/^/            /')"; else echo "$2"; fi));
 SQL
 }

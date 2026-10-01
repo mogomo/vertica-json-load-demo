@@ -1,6 +1,7 @@
 # Results
 
-Phase 1: one 1-billion-row table, three methods. Phase 2: ten tables in parallel.
+Phase 1: one 1-billion-row table, three methods. Phases 2 and 3: ten tables, the JSON parsed once,
+10 parallel MERGEs.
 
 ## Test system
 
@@ -27,9 +28,9 @@ Phase 1: one 1-billion-row table, three methods. Phase 2: ten tables in parallel
 | `ANALYZE_STATISTICS` on both tables | 14 s | |
 | 1M JSON change records (22 awk processes) | 0.3 s | |
 
-## Applying 1 million changes to 1 billion rows
+## Phase 1: 1 million changes into 1 billion rows
 
-`./apply.sh --runs 3`. Each method starts from the same pristine table (reset with
+`./phase1.sh --runs 3`. Each method starts from the same pristine table (reset with
 `COPY_TABLE`, not timed). The timer covers **parsing the JSON + loading + applying**.
 
 <!-- results:begin -->
@@ -41,7 +42,7 @@ Phase 1: one 1-billion-row table, three methods. Phase 2: ten tables in parallel
 <!-- results:end -->
 
 All three methods produced **identical data** in every run: 56,156,934 current rows in the
-touched partitions and newer, with the same checksum. A separate `./apply.sh --full-check`
+touched partitions and newer, with the same checksum. A separate `./phase1.sh --full-check`
 run compared all **1,000,500,000** current rows of the three methods (1,000,000,000 + 500,000
 inserted) and found the same count and checksum everywhere.
 
@@ -92,72 +93,99 @@ table in 0.04–0.11 s and uses no extra disk: the method tables share the stora
 GB). Note that `v_monitor.projection_storage` counts shared containers once per table, so it
 reports ~38 GB for each copy.
 
-## Phase 2: 10 tables in parallel
+## Phases 2 and 3: one parse, 10 parallel MERGEs
 
-The 1-billion-row `txn` table plus 9 more ADABAS files of 60,000,000 rows each (customer,
-account, card, loan, payment, policy, claim, employees, vehicles: groups, multiple-value fields
-and periodic groups, see [ADABAS_MAPPING.md](ADABAS_MAPPING.md)). Every table receives
-1,000,000 multi-level JSON changes (500,000 updates + 500,000 inserts): 10,000,000 changes in
-all. Each table runs its own pipeline, COPY of its JSON files into a delta table, then an
-optimized MERGE, and `--parallel` sets how many pipelines run at once.
+Ten tables: the 1-billion-row `txn` table plus 9 more ADABAS files of 60,000,000 rows each
+(customer, account, card, loan, payment, policy, claim, employees, vehicles; groups,
+multiple-value fields and periodic groups, see [ADABAS_MAPPING.md](ADABAS_MAPPING.md)). Each
+table receives 1,000,000 multi-level JSON changes (500,000 updates + 500,000 inserts):
+10,000,000 changes in all. `generate_multi.sh` writes the **same** records in two shapes:
 
-`./generate_multi.sh` built the 9 tables (540M rows, 27 GB) in 2 min 14 s at 4.4M rows/s,
-and the 9M JSON records (72 files, 3.3 GB) in 8 s.
+| | Shape | Files |
+|---|---|---|
+| Phase 2 | one record per line, the table named in the header, the 10 tables mixed in every file: `{"hdr":{"file":"customer","isn":…},"customer":{…}}` | 22 files, 3.8 GB, 10,000,000 lines |
+| Phase 3 | one ADABAS transaction per line, an array of changed records for each file (0, 1 or 2 records each): `{"et_id":…,"customer":[{…},{…}],"account":[],…}` | 22 files, 3.7 GB, 1,000,000 lines |
 
-`./apply_multi.sh --parallel 10,5,1 --runs 3`. The wall-clock runs from the start of the first
-COPY to the commit of the last MERGE:
+`generate_multi.sh` built the 9 tables (540M rows, 27 GB) in 2 min 4 s at 4.35M rows/s and
+both JSON shapes in 11 s.
 
-<!-- multi:begin -->
-| Tables at a time | Wall-clock (avg) | Runs | JSON rows/s | vs one at a time |
-|---|---:|---|---:|---:|
-| **10** (all in parallel) | **12.24 s** | 12.50 / 12.42 / 11.81 s | 817K | 2.3x |
-| 5 (a new table starts when one finishes) | 12.88 s | 13.18 / 12.98 / 12.47 s | 777K | 2.2x |
-| 1 (one after the other) | 28.20 s | 28.30 / 28.27 / 28.04 s | 355K | 1.0x |
+Both phases do the same two timed steps:
 
-Per table, average of 3 runs (parse + load / MERGE / total, in seconds):
+1. **One COPY parses every JSON file once** into a staging table.
+   - Phase 2, `stg_flat`: one row per record, with the columns of all 10 tables side by side
+     (`customer__first_name`, …), partitioned and sorted by table. A record fills only its own
+     table's columns.
+   - Phase 3, `stg_doc`: one row per transaction. `FJSONPARSER(flatten_arrays=true)` flattens
+     the arrays too, so the 2nd customer record of a document arrives as
+     `"customer.1.rec.name.first"`, and `stg_doc` has 2 slots of columns per table named
+     exactly like those keys.
+2. **10 optimized MERGEs, one per table**, read their rows straight from the staging table
+   (phase 2: `WHERE file = '<table>'`; phase 3: `UNION ALL` of the table's slots), at most
+   `--parallel` at a time.
 
-| Table | Rows | 1 at a time | 5 at a time | 10 at a time |
-|---|---:|---:|---:|---:|
-| txn | 1,000,000,000 | 1.36 / 0.92 / **2.28** | 3.78 / 1.44 / **5.22** | 6.32 / 2.46 / **8.78** |
-| customer | 60,000,000 | 2.31 / 2.03 / **4.34** | 5.45 / 4.52 / **9.97** | 9.52 / 2.67 / **12.19** |
-| account | 60,000,000 | 1.72 / 0.68 / **2.40** | 4.59 / 1.14 / **5.73** | 8.25 / 1.67 / **9.92** |
-| card | 60,000,000 | 1.79 / 0.71 / **2.51** | 4.66 / 1.48 / **6.14** | 8.63 / 1.63 / **10.26** |
-| loan | 60,000,000 | 1.85 / 0.69 / **2.54** | 4.49 / 1.18 / **5.67** | 8.50 / 1.73 / **10.23** |
-| payment | 60,000,000 | 1.88 / 1.83 / **3.71** | 4.35 / 2.96 / **7.31** | 9.42 / 2.57 / **11.99** |
-| policy | 60,000,000 | 1.84 / 0.71 / **2.55** | 4.07 / 1.26 / **5.33** | 8.91 / 1.54 / **10.45** |
-| claim | 60,000,000 | 1.74 / 0.66 / **2.40** | 3.97 / 1.20 / **5.16** | 8.72 / 1.49 / **10.21** |
-| employees | 60,000,000 | 2.08 / 0.98 / **3.06** | 4.32 / 1.42 / **5.74** | 9.50 / 1.52 / **11.02** |
-| vehicles | 60,000,000 | 1.67 / 0.69 / **2.36** | 2.14 / 0.76 / **2.90** | 8.51 / 1.65 / **10.15** |
-<!-- multi:end -->
+`./phase2.sh --parallel 10,5,1 --runs 3` and `./phase3.sh --parallel 10,5,1 --runs 3`:
 
-Every run of every setting passed the check: each table holds its base rows plus the 500,000
-inserts, exactly 1,000,000 rows carry the new batch, and their checksum over all columns equals
-the checksum of the JSON rows.
+<!-- phases23:begin -->
+| | MERGEs at a time | COPY (one parse) | 10 MERGEs | **Total** | Changes/s | Runs (total) |
+|---|---:|---:|---:|---:|---:|---|
+| **Phase 2** (flat records) | 10 | 30.10 s | 2.46 s | **32.56 s** | 307K | 32.73 / 32.13 / 32.81 s |
+| | 5 | 30.16 s | 2.98 s | 33.14 s | 302K | 33.33 / 33.13 / 32.97 s |
+| | 1 | 29.95 s | 8.65 s | 38.60 s | 259K | 39.09 / 38.17 / 38.55 s |
+| **Phase 3** (nested documents) | 10 | 20.90 s | 5.62 s | **26.51 s** | 377K | 27.07 / 26.50 / 25.96 s |
+| | 5 | 20.50 s | 6.30 s | 26.79 s | 373K | 26.82 / 26.85 / 26.71 s |
+| | 1 | 20.66 s | 14.80 s | 35.45 s | 282K | 35.35 / 35.30 / 35.70 s |
+
+MERGE time per table, average of 3 runs (seconds):
+
+| Table | Rows | Phase 2: 10 / 5 / 1 at a time | Phase 3: 10 / 5 / 1 at a time |
+|---|---:|---:|---:|
+| txn | 1,000,000,000 | 1.92 / 1.32 / 0.93 | 5.28 / 3.62 / 2.51 |
+| customer | 60,000,000 | 2.46 / 2.17 / 1.40 | 5.61 / 4.77 / 1.89 |
+| account | 60,000,000 | 1.74 / 1.14 / 0.70 | 4.86 / 3.52 / 1.24 |
+| card | 60,000,000 | 1.78 / 1.22 / 0.76 | 5.03 / 3.53 / 1.31 |
+| loan | 60,000,000 | 1.69 / 1.15 / 0.71 | 4.89 / 3.50 / 1.26 |
+| payment | 60,000,000 | 2.06 / 1.41 / 0.98 | 5.30 / 2.32 / 1.41 |
+| policy | 60,000,000 | 1.79 / 1.12 / 0.75 | 5.09 / 2.14 / 1.28 |
+| claim | 60,000,000 | 1.73 / 1.06 / 0.70 | 4.58 / 2.09 / 1.20 |
+| employees | 60,000,000 | 2.02 / 1.39 / 0.98 | 5.25 / 2.32 / 1.44 |
+| vehicles | 60,000,000 | 1.72 / 0.81 / 0.69 | 4.86 / 1.52 / 1.22 |
+<!-- phases23:end -->
+
+Every one of the 18 runs passed the check on every table: base rows + 500,000 inserts,
+exactly 1,000,000 rows of the new batch, and their checksum over all columns equal to the
+checksum of the source rows in the staging table.
 
 ### What it means
 
-- **Parallel pays: 28.2 s → 12.2 s** for 10 million JSON changes in 10 tables, 2.3 times
-  faster than one table after the other.
-- **10 at a time vs 5 at a time makes little difference** (12.2 s vs 12.9 s). The bottleneck is
-  JSON parsing: one COPY already parses its files with several threads (8 files per table,
-  22 for txn), so with five tables at once the 22 cores are already busy. Beyond that,
-  extra concurrency only stretches each table's time (2.3 → 8.8 s for txn) while the total
-  stays the same. On this machine the ceiling is about **800,000 parsed and merged JSON rows
-  per second**.
-- So 10 in parallel is not "too heavy": it is safe and slightly faster, with every MERGE
-  still on the optimized plan. Five at a time is a good choice when other work shares the
-  database, since it gives the same throughput with half the sessions and memory.
-- The size of the target hardly matters: the MERGE of 1M changes into the 1B-row table took
-  0.92 s, against 0.66–2.03 s for the 60M-row tables. The cost follows the changes and the
-  width of the records (customer and payment, with the most columns and nested arrays, are the
-  slowest).
+- **Parsing is the job.** The single COPY takes 79–92 % of the time; the 10 MERGEs into 1.54
+  billion rows in all take 2.5 s (phase 2) and 5.6 s (phase 3) when they run in parallel.
+- **Parse once.** One COPY over all the files, then fan out inside the database. Ten COPYs over
+  the same mixed files would each parse all 10M records.
+- **Nested documents parse faster than flat lines:** 20.9 s vs 30.1 s for the same 10M
+  records. Phase 3 hands the parser 1M rows instead of 10M; the per-row cost (above all the
+  ~160 mostly empty columns of the flat staging table) is paid ten times less often. For
+  comparison, 1M records into one narrow table parse in 1.2 s (phase 1).
+- **The phase 2 MERGEs are faster** (2.5 s vs 5.6 s): `stg_flat` is sorted by `(file, isn)`, so
+  each MERGE reads a presorted slice and Vertica uses a merge join. Phase 3's `UNION ALL` of
+  slots is not sorted on `isn`, so it uses a hash join. Both are the optimized
+  `DML DELETE + DML INSERT` plan.
+- **10 or 5 at a time hardly differ** (32.6 vs 33.1 s, 26.5 vs 26.8 s); both beat one after the
+  other by 6–9 s. Ten parallel MERGEs are not "too heavy" for this machine.
+- **Fixed slots vs maps.** Phase 3 needs a maximum number of records per file in one
+  transaction (2 here, like the maximum occurrences of an ADABAS periodic group). Unbounded
+  arrays can be kept as VMaps instead (`FJSONPARSER(flatten_arrays=false, flatten_maps=false)`,
+  one `LONG VARBINARY` column per table) and exploded with `MAPITEMS` + `MAPLOOKUP`. We measured
+  that alternative: the COPY was 3x slower, reading the fields ~15x slower, and a MERGE that
+  reads a `MAPITEMS` query directly gets the generic, non-optimized plan, so the rows must be
+  materialized first.
 
 ## Reproduce
 
 ```bash
 ./generate.sh              # ~12 min, ~116 GB in Vertica
-./apply.sh --runs 3        # ~2.5 min including the checks
-./apply.sh --full-check    # optional: compare all 1 billion current rows (~6 min)
-./generate_multi.sh        # ~2.5 min, ~27 GB in Vertica + 3.3 GB of JSON
-./apply_multi.sh --parallel 10,5,1 --runs 3
+./phase1.sh --runs 3       # ~2.5 min including the checks
+./phase1.sh --full-check   # optional: compare all 1 billion current rows (~6 min)
+./generate_multi.sh        # ~2.5 min, ~27 GB in Vertica + 7.5 GB of JSON
+./phase2.sh --parallel 10,5,1 --runs 3
+./phase3.sh --parallel 10,5,1 --runs 3
 ```

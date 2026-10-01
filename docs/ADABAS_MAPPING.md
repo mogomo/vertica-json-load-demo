@@ -52,10 +52,10 @@ The base table itself is not loaded from JSON: its billion rows are generated in
 with SQL, as the same columns. Only the changes travel as JSON, and parsing them is part of
 the measured time.
 
-## The 10 files of phase 2
+## The 10 files of phases 2 and 3
 
-Phase 2 (`generate_multi.sh`, `apply_multi.sh`) adds nine banking, insurance and classic ADABAS
-demo files next to TXN. They're defined in [`conf/tables.def`](../conf/tables.def), which
+Phases 2 and 3 (`generate_multi.sh`, `phase2.sh`, `phase3.sh`) add nine banking, insurance and
+classic ADABAS demo files next to TXN. They're defined in [`conf/tables.def`](../conf/tables.def), which
 drives the JSON generator, the DDL, the SQL row generator, the COPY mapping and the MERGE:
 
 | # | File | Table | Rows | Hierarchy |
@@ -90,6 +90,39 @@ A line of `tables.def` looks like this:
 F|customer|address.1.city|addr2_city|VARCHAR(30)|city?50
    table   JSON path      column     type        generator (50 % NULL)
 ```
+
+## The two shapes of phases 2 and 3
+
+`generate_multi.sh` writes the same 10,000,000 records (1,000,000 per file) twice.
+
+**Phase 2: one record per line, the files mixed.** The header names the file; the record
+sits under a key with the file's name, so every field has a unique flattened key:
+
+```json
+{"hdr":{"file":"customer","isn":57007920,"op":"U","ts":"…","batch":1},"customer":{"created":"2025-11-07","cust_no":"CU0057007920","name":{…},"phone":[…],"address":[…]}}
+{"hdr":{"file":"account","isn":57007920,"op":"U","ts":"…","batch":1},"account":{"created":"2025-11-07","acct_no":"AC…","balance":{…},"signatory":[…]}}
+```
+
+The COPY maps `"customer.address.1.city"` onto the staging column `customer__addr2_city` with a
+FILLER column, and `"hdr.file"` onto `file`, the partition key of `stg_flat`.
+
+**Phase 3: one ADABAS transaction (ET) per line.** A document carries an array of changed
+records for each file: 0, 1 or 2 records, about 10 per document.
+
+```json
+{"et_id":1,"et_ts":"2026-01-01 00:00:00",
+ "txn":[],
+ "customer":[{"hdr":{"isn":57007920,"op":"U",…},"rec":{"created":"2025-11-07","name":{…},"address":[{…},{…}]}}],
+ "account":[{"hdr":{…},"rec":{…}}],
+ "card":[{"hdr":{…},"rec":{…}},{"hdr":{…},"rec":{…}}],
+ …}
+```
+
+Up to five levels deep: document → file array → record → periodic group → field. With
+`FJSONPARSER(flatten_arrays=true)` the key of a field carries every level:
+`"card.1.rec.token.0.wallet"` is the wallet of the 1st token of the 2nd card record of the
+transaction. `stg_doc` has 2 slots of columns per file named exactly like those keys, so the
+COPY needs no column list, and a file's records are the `UNION ALL` of its slots.
 
 ## Flattening in the COPY
 

@@ -1,8 +1,8 @@
 # =============================================================================
-#  tables.def — the 10 ADABAS files of the multi-table phase
+#  tables.def — the 10 ADABAS files of phases 2 and 3
 # =============================================================================
-#  Used by generate_multi.sh and apply_multi.sh. Everything is derived from it:
-#    * the hierarchical (multi-level) JSON change records   (lib/gen_json.awk)
+#  Used by generate_multi.sh, phase2.sh and phase3.sh. Everything is derived from it:
+#    * the hierarchical (multi-level) JSON change records   (lib/gen_json.awk, gen_docs.awk)
 #    * the Vertica DDL and the SQL that generates the rows  (lib/multi.sh)
 #    * the COPY column mapping (JSON key -> column)         (lib/multi.sh)
 #    * the MERGE column lists                               (lib/multi.sh)

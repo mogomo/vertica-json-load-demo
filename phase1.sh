@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  apply.sh — apply the JSON change records to the fact table, three ways
+#  phase1.sh — PHASE 1: 1 million JSON changes into one 1-billion-row table, three ways
 # =============================================================================
 #  Every method starts from the same 1-billion-row table (reset with
 #  COPY_TABLE, not timed) and loads the same JSON files. The timer covers the
@@ -19,7 +19,7 @@
 #  checks all rows (slower: the Top-K view then reads the whole LAP).
 #  Safe to run again and again.
 #
-#  Usage: ./apply.sh [--runs N] [--method upsert,swap,merge] [--pause]
+#  Usage: ./phase1.sh [--runs N] [--method upsert,swap,merge] [--pause]
 #                    [--full-check | --no-check] [--no-color]
 # =============================================================================
 set -o errexit -o nounset -o pipefail
@@ -43,7 +43,7 @@ while (( $# )); do
         --no-check)    VALIDATE=0 ;;
         --no-color)    no_color ;;
         -h|--help)     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) die "unknown option '$1' (see ./apply.sh --help)" ;;
+        *) die "unknown option '$1' (see ./phase1.sh --help)" ;;
     esac
     shift
 done
@@ -59,9 +59,9 @@ CHANGES_DIR="$DEMO_DIR/changes"
 compgen -G "$CHANGES_DIR/*.json" >/dev/null || die "no JSON files in $CHANGES_DIR — run ./generate.sh"
 
 SESSION=$(date +%Y%m%d-%H%M%S)
-RUN_LOG="$LOG_DIR/apply_$SESSION"
+RUN_LOG="$LOG_DIR/phase1_$SESSION"
 mkdir -p "$RUN_LOG" "$REPORT_DIR"
-RESULTS_TSV="$REPORT_DIR/results.tsv"
+RESULTS_TSV="$REPORT_DIR/phase1_results.tsv"
 [[ -f $RESULTS_TSV ]] || printf 'session\trun\tmethod\tbase_rows\tchange_rows\tparse_load_ms\tapply_ms\ttotal_ms\tlive_rows\tchecksum\tdelete_vector_rows\n' > "$RESULTS_TSV"
 
 method_title() {
@@ -253,7 +253,7 @@ validate_run() {
 }
 
 summary() {
-    local out="$REPORT_DIR/summary.md"
+    local out="$REPORT_DIR/phase1_summary.md"
     chapter "RESULTS  $(fmt_num "$CHANGE_ROWS") JSON changes → $(fmt_num "$BASE_ROWS")-row fact table" \
             "$(fmt_num "$N_UPD") updates + $(fmt_num "$N_INS") inserts$( (( N_DEL > 0 )) && echo " + $(fmt_num "$N_DEL") deletes")   ·   $RUNS run(s)   ·   timer = parse JSON + load + apply"
     awk -F'\t' -v s="$SESSION" -v runs="$RUNS" -v order="${METHODS[*]}" -v B="$C_BOLD" -v Z="$C_RESET" -v G="$C_GREEN" -v md="$out.tmp" '
@@ -291,7 +291,7 @@ summary() {
 }
 
 # ---------------------------------------------------------------- main
-chapter "APPLY  $(fmt_num "$CHANGE_ROWS") JSON change records to a $(fmt_num "$BASE_ROWS")-row fact table, three ways" \
+chapter "PHASE 1 · $(fmt_num "$CHANGE_ROWS") JSON change records to a $(fmt_num "$BASE_ROWS")-row fact table, three ways" \
         "$(fmt_num "$N_UPD") updates of existing rows + $(fmt_num "$N_INS") inserts of new rows$( (( N_DEL > 0 )) && echo " + $(fmt_num "$N_DEL") deletes")   ·   files: ${CHANGES_DIR#"$ROOT_DIR"/}/"
 preflight
 for (( RUN = 1; RUN <= RUNS; RUN++ )); do

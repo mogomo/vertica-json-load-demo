@@ -24,9 +24,8 @@ load_config() {
     : "${JSON_FILES:=auto}"                # change files = COPY parse threads
     : "${GEN_SESSIONS:=auto}"              # parallel INSERT sessions while generating
     : "${REBUILD_SESSIONS:=auto}"          # parallel sessions of the swap rebuild
-    : "${MULTI_ROWS:=60M}"                 # multi-table phase: rows of each of the 9 other tables
-    : "${MULTI_JSON_FILES:=8}"             # multi-table phase: JSON files per table
-    : "${PARALLEL:=10}"                    # multi-table phase: tables loaded at the same time
+    : "${MULTI_ROWS:=60M}"                 # phases 2-3: rows of each of the 9 other tables
+    : "${PARALLEL:=10}"                    # phases 2-3: MERGEs running at the same time
     : "${COPY_NODE_CLAUSE:=ON ANY NODE}"
     : "${RESOURCE_POOL:=}"
     : "${SQL_PREVIEW_LINES:=40}"           # 0 = always print the full statement
@@ -39,7 +38,8 @@ load_config() {
     [[ $GEN_SESSIONS == auto ]] && GEN_SESSIONS=$(( NCPU / 2 > 1 ? NCPU / 2 : 1 ))
     [[ $REBUILD_SESSIONS == auto ]] && REBUILD_SESSIONS=$GEN_SESSIONS
     CHANGES_DIR="$DEMO_DIR/changes"
-    MULTI_DIR="$DEMO_DIR/multi"
+    PHASE2_DIR="$DEMO_DIR/phase2"
+    PHASE3_DIR="$DEMO_DIR/phase3"
     export VSQL_HOST VSQL_PORT VSQL_USER VSQL_PASSWORD VSQL_DATABASE
 }
 

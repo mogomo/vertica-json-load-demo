@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  generate_multi.sh — data for the multi-table phase
+#  generate_multi.sh — data for phases 2 and 3
 # =============================================================================
 #  Adds 9 more ADABAS files (conf/tables.def) next to the 1-billion-row fact
 #  table of generate.sh:
 #    1. vload.<table>_base: 60 million rows each, generated inside Vertica
 #       with SQL (parallel INSERT … SELECT, one monthly partition per statement)
-#    2. demo/multi/<table>/*.json: 1 million multi-level JSON change records
-#       per table (50% updates, 50% inserts), with groups, multiple-value
-#       fields and periodic groups (arrays of objects)
-#  The fact table (txn) uses vload.txn_base and demo/changes from generate.sh.
+#    2. 1 million multi-level JSON change records per table, for all 10 tables
+#       (50% updates, 50% inserts), written twice, in two shapes:
+#         demo/phase2/*.json  one record per line, the 10 tables mixed in
+#                             every file
+#         demo/phase3/*.json  one ADABAS transaction per line: a document with
+#                             an array of changed records for each file
 #
-#  Run ./generate.sh first. Then ./apply_multi.sh, as often as you like.
+#  Run ./generate.sh first. Then ./phase2.sh and ./phase3.sh, as often as you like.
 #  Usage: ./generate_multi.sh [--rows 60M] [--changes 1M] [--force] [--pause] [--no-color]
 # =============================================================================
 set -o errexit -o nounset -o pipefail
@@ -39,13 +41,14 @@ while (( $# )); do
 done
 load_config
 DEMO_DIR=$(cd "$DEMO_DIR" 2>/dev/null && pwd) || die "run ./generate.sh first"
-CHANGES_DIR="$DEMO_DIR/changes"; MULTI_DIR="$DEMO_DIR/multi"
+PHASE2_DIR="$DEMO_DIR/phase2"; PHASE3_DIR="$DEMO_DIR/phase3"
 [[ -f $DEMO_DIR/manifest.env ]] || die "run ./generate.sh first (the fact table and its JSON changes)"
 # the fact table's size comes from the first phase
 BASE_ROWS=$(. "$DEMO_DIR/manifest.env"; echo "$BASE_ROWS")
 split_changes
 FACT_TABLE=$(defs_fact_table)
 mapfile -t NEW_TABLES < <(defs_new_tables)
+TABLES=("$FACT_TABLE" "${NEW_TABLES[@]}")
 RUN_LOG="$LOG_DIR/generate_multi_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_LOG"
 
@@ -101,45 +104,63 @@ step_tables() {
         | timed "analyze statistics" "$RUN_LOG/analyze"
 }
 
+# one output file pair: documents [d0, d1) of the change stream
+json_file() {   # <file#> <d0> <d1>
+    local f=$1 d0=$2 d1=$3 t ti=0 tmp="$DEMO_DIR/.tmp_$1" slices=()
+    mkdir -p "$tmp"
+    for t in "${TABLES[@]}"; do
+        ti=$((ti + 1))
+        "$AWK_BIN" -v defs="$DEFS_FILE" -v tbl="$t" -v mode=dose -v dose=1 -v base_rows="$(table_rows "$t")" \
+            -v k0="$d0" -v k1="$d1" -v n_upd="$N_UPD" -v n_del="$N_DEL" -v n_ins="$N_INS" -v hot_pct="$HOT_PCT" \
+            -v start_date="$START_DATE" -v span_days="$SPAN_DAYS" -v seed=$(( SEED + ti * 1000003 + f * 104729 )) \
+            -f "$ROOT_DIR/lib/gen_json.awk" > "$tmp/$t.json"
+        slices+=("$tmp/$t.json")
+    done
+    "$AWK_BIN" -v tables="${TABLES[*]}" -v d0="$d0" -v d1="$d1" -v et_day="$ET_DAY" \
+        -v phase2="$PHASE2_DIR/$(printf 'part_%03d.json' "$f")" -v phase3="$PHASE3_DIR/$(printf 'part_%03d.json' "$f")" \
+        -f "$ROOT_DIR/lib/gen_docs.awk" "${slices[@]}"
+    rm -rf "$tmp"
+}
+
 step_json() {
-    local t ti=0 f files=$MULTI_JSON_FILES k0 k1 start running=0 awk_bin
-    (( files > CHANGE_ROWS )) && files=$CHANGE_ROWS
-    awk_bin=$(command -v mawk || command -v gawk || command -v awk)
-    explain_step M3 "$(fmt_num "$CHANGE_ROWS") multi-level JSON changes per table → ${MULTI_DIR#"$ROOT_DIR"/}/<table>/" \
-        "Writes $files JSON Lines files per table: $(fmt_num "$N_UPD") updates of existing ISNs (newest ${HOT_PCT}% of the table) and $(fmt_num "$N_INS") inserts of new ISNs. The records nest up to three levels: groups (objects), multiple-value fields (arrays) and periodic groups (arrays of objects)." \
-        "Each table has its own files, so the ten tables can be parsed and loaded by ten independent COPY statements at the same time."
-    rm -rf "$MULTI_DIR"; mkdir -p "$MULTI_DIR"
+    local f files=$JSON_FILES quads d0 d1 start running=0
+    AWK_BIN=$(command -v mawk || command -v gawk || command -v awk)
+    ET_DAY=$(date -d "$START_DATE + $SPAN_DAYS days" +%F 2>/dev/null || echo 2026-01-01)
+    (( CHANGE_ROWS % 4 == 0 )) || die "--changes must be a multiple of 4"
+    quads=$(( CHANGE_ROWS / 4 ))
+    (( files > quads )) && files=$quads
+    explain_step M3 "$(fmt_num "$CHANGE_ROWS") JSON changes for each of the ${#TABLES[@]} tables, in two shapes" \
+        "Generates $(fmt_num "$N_UPD") updates (newest ${HOT_PCT}% of each table) and $(fmt_num "$N_INS") inserts per table, with groups, multiple-value fields and periodic groups. The same $(fmt_num $(( CHANGE_ROWS * ${#TABLES[@]} ))) records are written twice, in $files files each: ${PHASE2_DIR#"$ROOT_DIR"/}/ holds one record per line, the 10 tables mixed in every file; ${PHASE3_DIR#"$ROOT_DIR"/}/ holds one ADABAS transaction per line ($(fmt_num "$CHANGE_ROWS") documents), each with an array of changed records for every file (0, 1 or 2 records)." \
+        "Real CDC files mix the records of many files. Phases 2 and 3 load exactly the same changes, so their timings compare directly; only the shape of the JSON differs."
+    rm -rf "$PHASE2_DIR" "$PHASE3_DIR" "$DEMO_DIR/multi"; mkdir -p "$PHASE2_DIR" "$PHASE3_DIR"
     start=$(now_ms)
-    for t in "${NEW_TABLES[@]}"; do
-        ti=$((ti + 1)); mkdir -p "$MULTI_DIR/$t"
-        for (( f = 0; f < files; f++ )); do
-            k0=$(( CHANGE_ROWS * f / files )); k1=$(( CHANGE_ROWS * (f + 1) / files ))
-            "$awk_bin" -v defs="$DEFS_FILE" -v tbl="$t" -v mode=dose -v dose=1 -v base_rows="$MULTI_ROWS" \
-                -v k0="$k0" -v k1="$k1" -v n_upd="$N_UPD" -v n_del="$N_DEL" -v n_ins="$N_INS" -v hot_pct="$HOT_PCT" \
-                -v start_date="$START_DATE" -v span_days="$SPAN_DAYS" -v seed=$(( SEED + ti * 1000003 + f * 104729 )) \
-                -f "$ROOT_DIR/lib/gen_json.awk" > "$MULTI_DIR/$t/$(printf 'part_%03d.json' $((f + 1)))" &
-            running=$((running + 1))
-            if (( running >= NCPU )); then wait -n || die "generator failed"; running=$((running - 1)); fi
-        done
+    for (( f = 0; f < files; f++ )); do
+        d0=$(( 4 * (quads * f / files) )); d1=$(( 4 * (quads * (f + 1) / files) ))
+        json_file $((f + 1)) "$d0" "$d1" &
+        running=$((running + 1))
+        if (( running >= NCPU )); then wait -n || die "generator failed"; running=$((running - 1)); fi
     done
     while (( running > 0 )); do wait -n || die "generator failed"; running=$((running - 1)); done
     LAST_MS=$(( $(now_ms) - start ))
-    printf '  %s⏱%s  %-44s %s%8s s%s  (%d files, %s MB)\n' "$C_GREEN" "$C_RESET" "write JSON change files" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" \
-        $(( files * ${#NEW_TABLES[@]} )) "$(du -sm "$MULTI_DIR" | awk '{print $1}')"
-    cat > "$MULTI_DIR/manifest.env" <<EOF
+    printf '  %s⏱%s  %-44s %s%8s s%s  (2 × %d files, %s MB + %s MB)\n' "$C_GREEN" "$C_RESET" "write JSON change files" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" \
+        "$files" "$(du -sm "$PHASE2_DIR" | awk '{print $1}')" "$(du -sm "$PHASE3_DIR" | awk '{print $1}')"
+    cat > "$DEMO_DIR/multi_manifest.env" <<EOF
 # written by generate_multi.sh on $(date '+%F %T')
 MULTI_ROWS=$MULTI_ROWS
 MULTI_CHANGE_ROWS=$CHANGE_ROWS
 MULTI_N_UPD=$N_UPD
 MULTI_N_DEL=$N_DEL
 MULTI_N_INS=$N_INS
-MULTI_TABLES="${NEW_TABLES[*]}"
+MULTI_TABLES="${TABLES[*]}"
+MULTI_MAX_OCCURS=2
 EOF
-    info "one customer update, pretty-printed (group NAME, MU PHONE, PE ADDRESS):"
+    info "phase 2 shape: one record per line (first 3 lines of a file, cut):"
+    head -n 3 "$PHASE2_DIR/part_001.json" | cut -c1-140 | sed 's/$/ …/; s/^/        /'
+    info "phase 3 shape: one ADABAS transaction per line (first document, first two files):"
     if command -v python3 >/dev/null; then
-        head -n 1 "$MULTI_DIR/customer/part_001.json" | python3 -m json.tool | sed 's/^/        /'
+        head -n 1 "$PHASE3_DIR/part_001.json" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps({x: d[x] for x in list(d)[:4]}, indent=2))' | sed 's/^/        /'
     else
-        head -n 1 "$MULTI_DIR/customer/part_001.json" | sed 's/^/        /'
+        head -n 1 "$PHASE3_DIR/part_001.json" | cut -c1-400 | sed 's/^/        /'
     fi
 }
 
@@ -153,7 +174,7 @@ step_summary() {
         | while IFS='|' read -r t rows mb; do
               info "$(printf '%-16s %16s rows  %10s MB' "$t" "$(fmt_num "$rows")" "$(fmt_num "$mb")")"
           done
-    ok "done — now run ./apply_multi.sh"
+    ok "done — now run ./phase2.sh and ./phase3.sh"
 }
 
 START_ALL=$(now_ms)
