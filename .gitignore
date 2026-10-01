@@ -1,6 +1,5 @@
-# local settings and generated artifacts
 vload.env
-data/
+demo/
 logs/
 reports/
 *.log

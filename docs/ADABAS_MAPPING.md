@@ -10,73 +10,69 @@ repeats up to N times, like an array of structs). A DDM gives the fields long na
 (ADABAS Event Replicator, or log-based replication products) publish every change as a record
 carrying the ISN, the operation and the after-image (or the before-image for a delete).
 
-## The JSON produced by the generator
+## The JSON change records
 
-One line per change (JSON Lines), with a CDC header and the record:
+The demo uses one ADABAS file, **TXN** (file 16, account transactions), as the fact table.
+`generate.sh` writes the change records as JSON Lines (one change per line) into
+`demo/changes/`, with a CDC header and the record:
 
 ```json
-{"hdr":{"isn":951,"op":"U","ts":"2026-01-01 00:00:00.000001","batch":1},
- "rec":{"created":"2025-11-07",
-        "cust_no":"CU0000000951",
-        "name":{"first":"Tamar","last":"Jackson"},                   <- group
-        "phone":["+36-765-3178602",null,null],                      <- MU field
-        "address":[{"type":"H","street":"191 Brown RD","city":"PARIS","country":"FR"},
-                   {"type":"W","street":"114 Levi RD","city":"ROME","country":"IT"}]}}   <- PE group
+{"hdr":{"isn":950000001,"op":"U","ts":"2026-01-01 00:00:00.000000","batch":1},
+ "rec":{"created":"2025-11-07","txn_ref":"TX0000000950000001","acct_isn":31613501,
+        "card_isn":null,"type":"FEE","amount":4414.00,"currency":"CHF","booking_date":"2025-11-08",
+        "merchant":{"mcc":7747,"name":"Smith","city":"PARIS","country":"ES"},   <- group (optional)
+        "tag":["FOREIGN"],                                                       <- MU field (0-2 values)
+        "reversal":false}}
 ```
 
 | Header key | Meaning |
 |---|---|
-| `hdr.isn` | ADABAS ISN, the business key of the record |
+| `hdr.isn` | ADABAS ISN, the key of the record |
 | `hdr.op` | `I` insert, `U` update (after-image), `D` delete |
 | `hdr.ts` | commit time of the change; orders the versions of an ISN |
-| `hdr.batch` | 0 = initial unload (base), n = CDC dose n |
+| `hdr.batch` | 0 = the rows of the base table, 1 = the change files |
 | `rec.created` | creation date of the record, which never changes. It's the partition key. |
 
-The 10 files are defined in [`conf/tables.def`](../conf/tables.def). They're banking and
-insurance style files, plus the two classic ADABAS demo files, EMPLOYEES and VEHICLES:
+The columns of the table, with their JSON keys, are listed once in `TXN_COLUMNS` at the top
+of [`lib/sql.sh`](../lib/sql.sh). The DDL, the COPY mapping and the MERGE are all built from
+that list.
 
-| # | File | Table | Hierarchy |
-|---|---|---|---|
-| 11 | Customer | `customer` | group NAME, MU PHONE (3), PE ADDRESS (2) |
-| 12 | Account | `account` | group BALANCE, MU SIGNATORY (3) |
-| 13 | Card | `card` | group LIMITS, PE TOKEN (2) |
-| 14 | Loan | `loan` | group TERMS, PE COLLATERAL (2) |
-| 15 | Payment | `payment` | groups DEBTOR / CREDITOR, MU REMITTANCE (2) |
-| 16 | Transaction | `txn` | group MERCHANT |
-| 17 | Policy | `policy` | group PREMIUM, PE COVERAGE (2), MU BENEFICIARY (2) |
-| 18 | Claim | `claim` | group INCIDENT, PE PAYOUT (2) |
-| 19 | Employees | `employees` | groups FULL-NAME / FULL-ADDRESS, MU LANG (2), PE INCOME (2) |
-| 20 | Vehicles | `vehicles` | group MAKE-MODEL, MU SERVICE-DATE (3) |
+| JSON key | Column | Type |
+|---|---|---|
+| `hdr.isn` | `isn` | `BIGINT NOT NULL` (primary key, declared) |
+| `hdr.op`, `hdr.ts`, `hdr.batch` | `op_code`, `change_ts`, `batch_id` | `CHAR(1)`, `TIMESTAMP`, `INT` |
+| `rec.created` | `created_date` | `DATE` (partition key) |
+| `rec.txn_ref`, `rec.acct_isn`, `rec.card_isn`, `rec.type` | `txn_ref`, `acct_isn`, `card_isn`, `txn_type` | |
+| `rec.amount`, `rec.currency`, `rec.booking_date` | `amount`, `currency`, `booking_date` | |
+| `rec.merchant.mcc` … `rec.merchant.country` | `mcc`, `merchant_name`, `merchant_city`, `merchant_country` | group MERCHANT |
+| `rec.tag.0`, `rec.tag.1` | `tag_1`, `tag_2` | MU field TAG |
+| `rec.reversal` | `is_reversal` | `BOOLEAN` |
 
-To add a field, a table or a PE occurrence, edit `tables.def`. The generator, DDL, COPY
-mapping and MERGE statements all follow from it. A line looks like this:
-
-```
-F|customer|address.1.city|addr2_city|VARCHAR(30)|city?50
-   table   JSON path      column     type        generator (50 % NULL)
-```
+The base table itself is not loaded from JSON: its billion rows are generated inside Vertica
+with SQL, as the same columns. Only the changes travel as JSON, and parsing them is part of
+the measured time.
 
 ## Flattening in the COPY
 
 The hierarchy is flattened **during** the COPY, with no landing table:
 
 1. `FJSONPARSER(flatten_arrays = true)` turns every leaf into a key built from its path:
-   `rec.name.first`, `rec.phone.0`, `rec.address.1.city`. Maps are flattened by default;
+   `rec.merchant.city`, `rec.tag.0`, `rec.tag.1`. Maps are flattened by default;
    `flatten_arrays` also flattens the MU/PE arrays.
 2. A `FILLER` column, named exactly like the key, receives each value.
-3. The real column is computed from the filler: `addr2_city AS "rec.address.1.city"`.
+3. The real column is computed from the filler: `tag_2 AS "rec.tag.1"`.
 
 ```sql
-COPY s.customer (
-    "rec.name.first"      FILLER VARCHAR(30),  first_name AS "rec.name.first",
-    "rec.phone.0"         FILLER VARCHAR(20),  phone_1    AS "rec.phone.0",
-    "rec.address.1.city"  FILLER VARCHAR(30),  addr2_city AS "rec.address.1.city",
+COPY vload.txn_upsert (
+    "rec.merchant.city"  FILLER VARCHAR(30),  merchant_city AS "rec.merchant.city",
+    "rec.tag.0"          FILLER VARCHAR(12),  tag_1         AS "rec.tag.0",
+    "rec.tag.1"          FILLER VARCHAR(12),  tag_2         AS "rec.tag.1",
     …)
-FROM '…/*.json.zst' ZSTD PARSER FJSONPARSER(flatten_arrays = true);
+FROM '/…/demo/changes/*.json' PARSER FJSONPARSER(flatten_arrays = true);
 ```
 
-Missing keys and JSON `null` become SQL NULL, so a PE group with fewer occurrences than
-columns loads fine. Values are cast to the column type while loading; a value that can't be
+Missing keys and JSON `null` become SQL NULL, so a missing group (no `merchant`) or an MU field
+with fewer values than columns loads fine. Values are cast to the column type while loading; a value that can't be
 cast sends the record to the rejects table.
 
 This is the **denormalized** mapping: a fixed number of MU/PE occurrences become numbered
@@ -92,4 +88,4 @@ columns. It keeps one row per ISN, which is what MERGE keys and Top-K projection
 
 Unmatched keys: the parser also reports the parent objects (`hdr`, `rec`) as keys with no
 matching column, which raises WARNING 10596 once per COPY. It's harmless: every leaf value is
-mapped. The runner keeps it in the log files and leaves it off the screen.
+mapped. The scripts keep it in the log files and leave it off the screen.

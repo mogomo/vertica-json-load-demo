@@ -1,65 +1,72 @@
 # shellcheck shell=bash
 # =============================================================================
-#  common.sh — configuration, presentation, vsql wrapper, parallel runner
+#  common.sh — configuration, console output, timers and the vsql wrapper
 # =============================================================================
+
+# "sql_function | timed …" must run timed in this shell (it sets LAST_MS)
+shopt -s lastpipe
 
 # ----------------------------------------------------------------- config
 load_config() {
     # defaults (override in vload.env or in the environment)
     : "${VSQL:=/opt/vertica/bin/vsql}"
-    : "${SCHEMA_PREFIX:=vload}"
-    : "${DATA_DIR:=$ROOT_DIR/data}"
+    : "${SCHEMA:=vload}"
+    : "${DEMO_DIR:=$ROOT_DIR/demo}"        # the JSON change files go to $DEMO_DIR/changes
     : "${LOG_DIR:=$ROOT_DIR/logs}"
     : "${REPORT_DIR:=$ROOT_DIR/reports}"
-    : "${DEFS_FILE:=$ROOT_DIR/conf/tables.def}"
-    : "${COMPRESSION:=zstd}"            # zstd | gzip | none
-    : "${FILES_PER_TABLE:=auto}"        # JSON files per table and stream
-    : "${GEN_JOBS:=auto}"               # parallel generator processes
-    : "${DOSES:=3}"                     # CDC doses applied after the base load
-    : "${DOSE_PCT:=1}"                  # dose size, % of the base rows
-    : "${DOSE_MIX:=60:10:30}"           # update:delete:insert share of a dose
-    : "${HOT_PCT:=5}"                   # updates/deletes hit the newest HOT_PCT % of rows
-    : "${START_DATE:=2023-01-01}"       # created_date of ISN 1
-    : "${SPAN_DAYS:=1096}"              # base data covers 3 years = 36 partitions
+    : "${BASE_ROWS:=1B}"                   # rows of the fact table
+    : "${CHANGE_ROWS:=1M}"                 # rows in the JSON change files
+    : "${CHANGE_MIX:=50:0:50}"             # update : delete : insert (percent)
+    : "${HOT_PCT:=5}"                      # updates/deletes hit the newest HOT_PCT % of the rows
+    : "${START_DATE:=2023-01-01}"          # created_date of ISN 1
+    : "${SPAN_DAYS:=1096}"                 # 3 years of data = 36 monthly partitions
     : "${SEED:=20260101}"
+    : "${JSON_FILES:=auto}"                # change files = COPY parse threads
+    : "${GEN_SESSIONS:=auto}"              # parallel INSERT sessions while generating
+    : "${REBUILD_SESSIONS:=auto}"          # parallel sessions of the swap rebuild
     : "${COPY_NODE_CLAUSE:=ON ANY NODE}"
     : "${RESOURCE_POOL:=}"
-    : "${COPY_BATCH_FILES:=0}"          # 0 = one COPY per table and stream; N = N files per COPY
-    : "${PURGE_PARALLEL:=0}"            # tables purged at the same time (0 = all)
-    : "${SQL_PREVIEW_LINES:=60}"        # 0 = always print the full statement
+    : "${SQL_PREVIEW_LINES:=40}"           # 0 = always print the full statement
     : "${PAUSE:=0}"
-    : "${DRY_RUN:=0}"
-    case $COMPRESSION in
-        zstd) COPY_FILTER=ZSTD; FILE_EXT=json.zst ;;
-        gzip) COPY_FILTER=GZIP; FILE_EXT=json.gz ;;
-        none) COPY_FILTER="";   FILE_EXT=json ;;
-        *) die "COMPRESSION must be zstd, gzip or none" ;;
-    esac
     NCPU=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
-    [[ $GEN_JOBS == auto ]] && GEN_JOBS=$NCPU
+    BASE_ROWS=$(parse_count "$BASE_ROWS")
+    CHANGE_ROWS=$(parse_count "$CHANGE_ROWS")
+    [[ $JSON_FILES == auto ]] && JSON_FILES=$(( NCPU < 24 ? NCPU : 24 ))
+    [[ $GEN_SESSIONS == auto ]] && GEN_SESSIONS=$(( NCPU / 2 > 1 ? NCPU / 2 : 1 ))
+    [[ $REBUILD_SESSIONS == auto ]] && REBUILD_SESSIONS=$GEN_SESSIONS
+    CHANGES_DIR="$DEMO_DIR/changes"
     export VSQL_HOST VSQL_PORT VSQL_USER VSQL_PASSWORD VSQL_DATABASE
 }
 
-# 10K, 1M, 250M, 1B, 12345 -> number
-parse_scale() {
-    local s=${1^^} n m=1
+# 10K, 1M, 1B, 12345 -> number
+parse_count() {
+    local s=${1^^} m=1
     case $s in
         *K) m=1000; s=${s%K} ;;
         *M) m=1000000; s=${s%M} ;;
         *B) m=1000000000; s=${s%B} ;;
     esac
-    [[ $s =~ ^[0-9]+$ ]] || die "invalid scale '$1' (use e.g. 10K, 1M, 1B)"
-    n=$((s * m))
-    (( n >= 10 * 10 )) || die "scale must be at least 100 rows"
-    echo "$n"
+    [[ $s =~ ^[0-9]+$ ]] || die "invalid number '$1' (use e.g. 10M, 1M, 1B)"
+    echo $(( s * m ))
 }
 
-scale_label() { # 1000000000 -> 1B
+# 1000000000 -> 1B
+count_label() {
     local n=$1
     if   (( n % 1000000000 == 0 )); then echo "$((n / 1000000000))B"
     elif (( n % 1000000 == 0 ));    then echo "$((n / 1000000))M"
     elif (( n % 1000 == 0 ));       then echo "$((n / 1000))K"
     else echo "$n"; fi
+}
+
+# the change mix as row counts: sets N_UPD N_DEL N_INS
+split_changes() {
+    local u d i
+    IFS=: read -r u d i <<< "$CHANGE_MIX"
+    (( u + d + i == 100 )) || die "CHANGE_MIX must add up to 100 (got $CHANGE_MIX)"
+    N_UPD=$(( CHANGE_ROWS * u / 100 ))
+    N_DEL=$(( CHANGE_ROWS * d / 100 ))
+    N_INS=$(( CHANGE_ROWS - N_UPD - N_DEL ))
 }
 
 # ----------------------------------------------------------------- output
@@ -71,8 +78,8 @@ else
     C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_MAGENTA='' C_CYAN=''
     IS_TTY=0
 fi
+no_color() { C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_MAGENTA='' C_CYAN=''; IS_TTY=0; }
 
-log()  { printf '%s\n' "$*"; }
 info() { printf '%s•%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
 ok()   { printf '%s✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s⚠ %s%s\n' "$C_YELLOW" "$*" "$C_RESET" >&2; }
@@ -80,7 +87,6 @@ die()  { printf '%s✘ %s%s\n' "$C_RED" "$*" "$C_RESET" >&2; exit 1; }
 
 hr() { printf '%s%s%s\n' "$C_DIM" "────────────────────────────────────────────────────────────────────────────────" "$C_RESET"; }
 
-# A chapter of the demo (method, phase)
 chapter() {
     echo
     printf '%s%s════════════════════════════════════════════════════════════════════════════════%s\n' "$C_BOLD" "$C_MAGENTA" "$C_RESET"
@@ -92,21 +98,22 @@ chapter() {
 # Wraps text to the terminal width with a hanging indent.
 wrap() { local indent=$1; shift; printf '%s\n' "$*" | fold -s -w $(( ${COLUMNS:-100} > 120 ? 110 : ${COLUMNS:-100} - 4 - ${#indent} )) | sed "2,\$s/^/${indent}/"; }
 
-# explain_step <id> <title> <what> <why> <sql>
-#   Prints the step banner, the explanation and the SQL that will run.
+# explain_step <id> <title> <what> <why> [sql]
+#   Prints the step banner, the explanation and the SQL that is about to run.
+#   QUIET=1 (repeated runs) prints the title only.
 explain_step() {
-    local id=$1 title=$2 what=$3 why=$4 sql=$5 n
+    local id=$1 title=$2 what=$3 why=$4 sql=${5:-} n
     echo
-    hr
     printf '%s%s▶ STEP %s  %s%s\n' "$C_BOLD" "$C_BLUE" "$id" "$title" "$C_RESET"
+    [[ ${QUIET:-0} == 1 ]] && return 0
     printf '%s  WHAT%s  ' "$C_BOLD" "$C_RESET"; wrap "        " "$what"
     printf '%s  WHY %s  ' "$C_BOLD" "$C_RESET"; wrap "        " "$why"
     if [[ -n $sql ]]; then
-        printf '%s  SQL %s  %s(shown for one table; the same statement runs for every table)%s\n' "$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+        printf '%s  SQL %s\n' "$C_BOLD" "$C_RESET"
         n=$(printf '%s\n' "$sql" | wc -l)
         if (( SQL_PREVIEW_LINES > 0 && n > SQL_PREVIEW_LINES )); then
             printf '%s\n' "$sql" | head -n "$SQL_PREVIEW_LINES" | highlight_sql
-            printf '        %s… %d more lines (full SQL in the run log)%s\n' "$C_DIM" $((n - SQL_PREVIEW_LINES)) "$C_RESET"
+            printf '        %s… %d more lines (full SQL in the log)%s\n' "$C_DIM" $((n - SQL_PREVIEW_LINES)) "$C_RESET"
         else
             printf '%s\n' "$sql" | highlight_sql
         fi
@@ -116,7 +123,7 @@ explain_step() {
 
 highlight_sql() {
     if (( IS_TTY )); then
-        sed -E "s/^/        /; s/\<(CREATE|TABLE|PROJECTION|SCHEMA|VIEW|DROP|IF|EXISTS|CASCADE|COPY|FROM|PARSER|STREAM|NAME|REJECTED|DATA|AS|FILLER|SELECT|INSERT|INTO|VALUES|MERGE|USING|ON|WHEN|MATCHED|NOT|THEN|UPDATE|SET|WHERE|AND|OR|UNION|ALL|ORDER|BY|SEGMENTED|HASH|NODES|PARTITION|LIMIT|OVER|DESC|LIKE|INCLUDING|PROJECTIONS|COMMIT|ALTER|RENAME|TO|PRIMARY|KEY|CONSTRAINT|DISABLED|COMMENT|IS|ANY|NODE|GROUP|COUNT|NULL)\>/${C_YELLOW}\1${C_RESET}/g"
+        sed -E "s/^/        /; s/\<(CREATE|TABLE|PROJECTION|SCHEMA|VIEW|DROP|IF|EXISTS|CASCADE|COPY|FROM|PARSER|STREAM|NAME|REJECTED|DATA|AS|FILLER|SELECT|INSERT|INTO|VALUES|MERGE|USING|ON|WHEN|MATCHED|NOT|THEN|UPDATE|SET|WHERE|AND|OR|UNION|ALL|ORDER|BY|SEGMENTED|HASH|NODES|PARTITION|LIMIT|OVER|DESC|LIKE|INCLUDING|PROJECTIONS|COMMIT|PRIMARY|KEY|CONSTRAINT|DISABLED|ANY|NODE|CROSS|JOIN|CASE|ELSE|END|NULL|REPLACE|BETWEEN|DISTINCT)\>/${C_YELLOW}\1${C_RESET}/g; s/(--.*)$/${C_DIM}\1${C_RESET}/"
     else
         sed 's/^/        /'
     fi
@@ -130,7 +137,7 @@ pause() {
 }
 
 fmt_num() { awk -v n="$1" 'BEGIN{ s=sprintf("%d", n); r=""; while (length(s) > 3) { r="," substr(s, length(s)-2) r; s=substr(s, 1, length(s)-3) } print s r }'; }
-# epoch milliseconds (bash 5 EPOCHREALTIME; GNU/uutils date otherwise)
+# epoch milliseconds (bash 5 EPOCHREALTIME; date otherwise)
 now_ms() {
     if [[ -n ${EPOCHREALTIME:-} ]]; then
         local t=${EPOCHREALTIME//[!0-9]/}
@@ -139,22 +146,19 @@ now_ms() {
         echo $(( $(date +%s%N) / 1000000 ))
     fi
 }
-secs()    { awk -v ms="$1" 'BEGIN{printf "%.2f", ms/1000}'; }
-rate()    { awk -v r="$1" -v ms="$2" 'BEGIN{ if (ms<=0) {print "-"; exit} v=r*1000/ms; if (v>=1e6) printf "%.2fM", v/1e6; else if (v>=1e3) printf "%.1fK", v/1e3; else printf "%.0f", v }'; }
+secs() { awk -v ms="$1" 'BEGIN{printf "%.2f", ms/1000}'; }
+hms()  { awk -v ms="$1" 'BEGIN{s=ms/1000; if (s<60) printf "%.1f s", s; else printf "%dm %02ds", int(s/60), int(s)%60}'; }
+rate() { awk -v r="$1" -v ms="$2" 'BEGIN{ if (ms<=0) {print "-"; exit} v=r*1000/ms; if (v>=1e6) printf "%.2fM", v/1e6; else if (v>=1e3) printf "%.0fK", v/1e3; else printf "%.0f", v }'; }
 
 # ----------------------------------------------------------------- vsql
-# vsql_exec <logfile> : runs SQL from stdin, output appended to <logfile>,
+# vsql_exec <logfile> : runs the SQL read from stdin and stops at the first
+# error. The SQL goes to <logfile>.sql, the output to <logfile>.out/.err;
 # stdout = result tuples (unaligned, no headers).
 vsql_exec() {
     local logf=$1 sql rc
     sql=$(cat)
-    {
-        printf -- '-- %s\n' "$(date '+%F %T')"
-        printf '%s\n' "$sql"
-    } >> "$logf.sql"
-    if [[ $DRY_RUN == 1 ]]; then return 0; fi
+    { printf -- '-- %s\n' "$(date '+%F %T')"; printf '%s\n' "$sql"; } >> "$logf.sql"
     if {
-        printf '\\set ON_ERROR_STOP on\n'
         [[ -n $RESOURCE_POOL ]] && printf 'SET SESSION RESOURCE_POOL = %s;\n' "$RESOURCE_POOL"
         printf '%s\n' "$sql"
     } | "$VSQL" -X -A -t -q -v ON_ERROR_STOP=1 2>>"$logf.err" | tee -a "$logf.out"; then
@@ -162,105 +166,79 @@ vsql_exec() {
     else
         rc=$?
     fi
+    # WARNING 10596 = JSON parent keys (hdr, rec, …) with no matching column: expected
     grep -v -e 'WARNING 10596' -e '^HINT:.*UNMATCHED_KEY' "$logf.err" | tail -5 >&2
     return "$rc"
 }
 
-# sums the row counts printed by one or more COPY statements
-sum_rows() { awk '/^[0-9]+$/ { s += $1 } END { print s + 0 }'; }
-
-# single query, returns tuples on stdout
+# single query, tuples on stdout
 vsql_query() { "$VSQL" -X -A -t -q -v ON_ERROR_STOP=1 -c "$1"; }
 
 vsql_check() {
     [[ -x $VSQL ]] || die "vsql not found at $VSQL (set VSQL in vload.env)"
-    vsql_query "SELECT 1" >/dev/null 2>&1 || die "cannot connect with vsql — check VSQL_HOST/VSQL_USER/VSQL_PASSWORD/VSQL_DATABASE in vload.env"
+    vsql_query "SELECT 1" >/dev/null 2>&1 \
+        || die "cannot connect with vsql: is the database up? (admintools -t start_db -d <db>) Check VSQL_HOST/VSQL_USER/VSQL_PASSWORD/VSQL_DATABASE in vload.env"
 }
 
-# ----------------------------------------------------------------- parallel
-# par_tables <step_id> <label> <worker_fn> [stream_prefix] [max_parallel]
-#   Runs "<worker_fn> <table>" for every table, concurrently (at most
-#   max_parallel at a time; 0 = all). Each worker prints the number of rows it
-#   processed as the last line of stdout. Records per-table and wall-clock
-#   timing in $RESULTS_FILE.
-par_tables() {
-    local step=$1 label=$2 fn=$3 stream=${4:-} limit=${5:-0} t start end e rc rows ms fails=0 total=0 sum_ms=0 disp
-    local tmp="$RUN_LOG_DIR/.par.$step"
-    rm -rf "$tmp"; mkdir -p "$tmp"
+table_exists() { [[ $(vsql_query "SELECT COUNT(*) FROM tables WHERE table_schema = '$SCHEMA' AND table_name = '$1'") == 1 ]]; }
+
+# timed <label> <logfile> : runs the SQL read from stdin with a live elapsed
+# time, then prints "label … seconds". Sets LAST_MS (wall-clock of the SQL,
+# vsql start to exit) and LAST_OUT (the result tuples).
+timed() {
+    local label=$1 logf=$2 sql tmp pid start end rc=0 spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+    sql=$(cat)
+    tmp=$(mktemp "${TMPDIR:-/tmp}/vload.XXXXXX")
     start=$(now_ms)
     (
-        for t in "${TABLES[@]}"; do
-            (
-                s=$(now_ms)
-                if rows=$("$fn" "$t" | tail -n 1); then
-                    e=$(now_ms); printf '%s %s %s %s\n' "${rows:-0}" $((e - s)) 0 "$e" > "$tmp/$t"
-                else
-                    e=$(now_ms); printf '%s %s %s %s\n' 0 $((e - s)) 1 "$e" > "$tmp/$t"
-                fi
-            ) &
-            if (( limit > 0 )); then
-                while (( $(jobs -rp | wc -l) >= limit )); do wait -n || true; done
-            fi
-        done
-        wait
+        if printf '%s\n' "$sql" | vsql_exec "$logf" > "$tmp.out"; then r=0; else r=$?; fi
+        now_ms > "$tmp.end"; exit "$r"
     ) &
-    disp=$!
-    progress_monitor "$start" "$stream" "$tmp" "$disp"
-    wait "$disp" || true
-    end=$start     # wall-clock = last worker finished (not the monitor's poll)
-    for t in "${TABLES[@]}"; do
-        read -r _ _ _ e < "$tmp/$t" 2>/dev/null && (( e > end )) && end=$e
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        (( IS_TTY )) && printf '\r  %s%s %-44s %8s s%s' "$C_CYAN" "${spin:i++%10:1}" "$label" "$(secs $(( $(now_ms) - start )))" "$C_RESET"
+        sleep 0.1
     done
-
-    local lines=""
-    for t in "${TABLES[@]}"; do
-        read -r rows ms rc _ < "$tmp/$t" || { rows=0 ms=0 rc=1; }
-        [[ $rows =~ ^[0-9]+$ ]] || rows=0
-        if (( rc == 0 )); then
-            lines+=$(printf '  %-12s %15s %10s %12s' "$t" "$(fmt_num "$rows")" "$(secs "$ms")" "$(rate "$rows" "$ms")")$'\n'
-        else
-            lines+=$(printf '  %s%-12s %15s %10s %12s  FAILED — see %s%s' "$C_RED" "$t" "-" "$(secs "$ms")" "-" "${RUN_LOG_DIR#"$ROOT_DIR"/}/$t.*.err" "$C_RESET")$'\n'
-            fails=$((fails + 1))
-        fi
-        total=$((total + rows)); sum_ms=$((sum_ms + ms))
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RUN_ID" "$SCALE_LABEL" "$METHOD" "$step" "$t" "$rows" "$ms" "$rc" >> "$RESULTS_FILE"
-    done
-    if (( total > 0 || fails > 0 )); then
-        printf '  %s%-12s %15s %10s %12s%s\n' "$C_DIM" "table" "rows" "seconds" "rows/s" "$C_RESET"
-        printf '%s' "$lines"
-    fi
-    local wall=$((end - start))
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$RUN_ID" "$SCALE_LABEL" "$METHOD" "$step" "_wall" "$total" "$wall" "$fails" >> "$RESULTS_FILE"
-    rm -rf "$tmp"
-    if (( fails > 0 )); then
-        die "$label: $fails table(s) failed"
-    fi
-    if (( total == 0 )); then
-        ok "$(printf '%s%s%s: %d tables in %s s wall-clock' "$C_BOLD" "$label" "$C_RESET" "${#TABLES[@]}" "$(secs "$wall")")"
-        return 0
-    fi
-    ok "$(printf '%s%s%s: %s rows in %s s wall-clock  (%s rows/s; %s s of work done in parallel → %sx)' \
-        "$C_BOLD" "$label" "$C_RESET" "$(fmt_num "$total")" "$(secs "$wall")" "$(rate "$total" "$wall")" "$(secs "$sum_ms")" \
-        "$(awk -v a="$sum_ms" -v b="$wall" 'BEGIN{printf "%.1f", (b>0? a/b : 0)}')")"
+    wait "$pid" || rc=$?
+    (( IS_TTY )) && printf '\r\033[K'
+    end=$(cat "$tmp.end" 2>/dev/null || now_ms)
+    LAST_MS=$(( end - start ))
+    LAST_OUT=$(cat "$tmp.out" 2>/dev/null)
+    rm -f "$tmp" "$tmp.out" "$tmp.end"
+    (( rc == 0 )) || die "$label failed — see ${logf#"$ROOT_DIR"/}.err"
+    printf '  %s⏱%s  %-44s %s%8s s%s\n' "$C_GREEN" "$C_RESET" "$label" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET"
 }
 
-# Live progress line while workers run. For COPY steps the rows loaded so far
-# are read from v_monitor.load_streams (by STREAM NAME prefix, unique per run).
-progress_monitor() {
-    local start=$1 stream=$2 tmp=$3 pid=$4 rows="" spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 el done_n n=${#TABLES[@]}
-    while kill -0 "$pid" 2>/dev/null; do
-        if (( IS_TTY )); then
-            el=$(( $(now_ms) - start ))
-            done_n=$(find "$tmp" -type f | wc -l)
-            if [[ -n $stream && $DRY_RUN != 1 && $((i % 4)) == 0 ]]; then
-                rows=$(vsql_query "SELECT COALESCE(SUM(accepted_row_count),0) FROM v_monitor.load_streams WHERE stream_name LIKE '${stream}%'" 2>/dev/null || echo "")
-            fi
-            printf '\r  %s%s %6ss  %d/%d tables done%s%s' "$C_CYAN" "${spin:i%10:1}" "$(secs "$el")" "$done_n" "$n" \
-                "${rows:+  |  rows loaded: $(fmt_num "$rows")  ($(rate "$rows" "$el") rows/s)}" "$C_RESET"
-            i=$((i + 1))
-        fi
-        sleep 0.25
+# timed_parallel <label> <logfile prefix> <n> <fn> : runs "<fn> <i> | vsql"
+# for i = 1 … n in n concurrent sessions. LAST_MS = wall-clock from the start
+# to the end of the last session.
+timed_parallel() {
+    local label=$1 logp=$2 n=$3 fn=$4 i tmpd start end e rc=0 spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' k=0 alive
+    local -a pids=()
+    tmpd=$(mktemp -d "${TMPDIR:-/tmp}/vload.XXXXXX")
+    start=$(now_ms)
+    for (( i = 1; i <= n; i++ )); do
+        (
+            if "$fn" "$i" | vsql_exec "${logp}_$i" >/dev/null; then r=0; else r=$?; fi
+            now_ms > "$tmpd/$i.end"; exit "$r"
+        ) &
+        pids+=($!)
     done
+    while :; do
+        alive=0
+        for e in "${pids[@]}"; do kill -0 "$e" 2>/dev/null && alive=$((alive + 1)); done
+        (( alive == 0 )) && break
+        (( IS_TTY )) && printf '\r  %s%s %-44s %8s s  (%d/%d sessions running)%s' "$C_CYAN" "${spin:k++%10:1}" "$label" "$(secs $(( $(now_ms) - start )))" "$alive" "$n" "$C_RESET"
+        sleep 0.1
+    done
+    for e in "${pids[@]}"; do wait "$e" || rc=$?; done
     (( IS_TTY )) && printf '\r\033[K'
-    return 0
+    end=$start
+    for (( i = 1; i <= n; i++ )); do
+        e=$(cat "$tmpd/$i.end" 2>/dev/null || echo "$start"); (( e > end )) && end=$e
+    done
+    rm -rf "$tmpd"
+    LAST_MS=$(( end - start ))
+    (( rc == 0 )) || die "$label failed — see ${logp#"$ROOT_DIR"/}_*.err"
+    printf '  %s⏱%s  %-44s %s%8s s%s  (%d parallel sessions)\n' "$C_GREEN" "$C_RESET" "$label" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" "$n"
 }

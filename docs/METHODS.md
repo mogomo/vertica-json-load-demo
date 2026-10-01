@@ -1,136 +1,191 @@
-# The three load / update methods
+# The three methods
 
-All three methods load the **same JSON files** into the **same table shape** and must end
-with **identical current data**; `./vload.sh validate` checks this with a row count and a
-checksum per table. They differ in how a CDC dose (inserts, updates and deletes) is applied.
+All three methods load the **same JSON files** into the **same table** and must end with
+**identical current data**. `apply.sh` checks this after every method with a row count and a
+checksum. The methods differ in how the changes (updates of existing rows and inserts of new
+ones) reach the 1-billion-row fact table.
 
 - [Common ground: the COPY](#common-ground-the-copy)
-- [Method 1: staging table + partition COPY/SWAP](#method-1--staging-table--partition-copyswap)
-- [Method 2: optimized MERGE](#method-2--optimized-merge)
-- [Method 3: insert-only journal + Top-K LAP](#method-3--insert-only-journal--top-k-live-aggregate-projection)
+- [Method 1: insert-only upsert (journal + Top-K LAP)](#method-1--insert-only-upsert-journal--top-k-lap)
+- [Method 2: staging table + partition COPY/SWAP](#method-2--staging-table--partition-copyswap)
+- [Method 3: optimized MERGE](#method-3--optimized-merge)
+- [Repeatable runs: COPY_TABLE](#repeatable-runs-copy_table)
 - [Choosing a method](#choosing-a-method)
 
 ---
 
 ## Common ground: the COPY
 
-Every method starts with the same statement: a bulk `COPY` of JSON files.
+Every method starts with the same statement: a bulk `COPY` of the JSON files. It is part of
+the measured time, because parsing JSON is a real part of the job.
 
 ```sql
-COPY vload_merge.customer (
-    "hdr.isn"               FILLER BIGINT,       isn          AS "hdr.isn",
-    "hdr.op"                FILLER CHAR(1),      op_code      AS "hdr.op",
-    ...
-    "rec.name.first"        FILLER VARCHAR(30),  first_name   AS "rec.name.first",
-    "rec.phone.0"           FILLER VARCHAR(20),  phone_1      AS "rec.phone.0",
-    "rec.address.1.city"    FILLER VARCHAR(30),  addr2_city   AS "rec.address.1.city"
+COPY vload.txn_merge_delta (
+    "hdr.isn"              FILLER BIGINT,        isn              AS "hdr.isn",
+    "hdr.op"               FILLER CHAR(1),       op_code          AS "hdr.op",
+    "hdr.ts"               FILLER TIMESTAMP,     change_ts        AS "hdr.ts",
+    …
+    "rec.merchant.city"    FILLER VARCHAR(30),   merchant_city    AS "rec.merchant.city",
+    "rec.tag.0"            FILLER VARCHAR(12),   tag_1            AS "rec.tag.0",
+    "rec.tag.1"            FILLER VARCHAR(12),   tag_2            AS "rec.tag.1",
+    "rec.reversal"         FILLER BOOLEAN,       is_reversal      AS "rec.reversal"
 )
-FROM '/data/1B/customer/base/*.json.zst' ON ANY NODE ZSTD
+FROM '/…/demo/changes/*.json' ON ANY NODE
 PARSER FJSONPARSER(flatten_arrays = true)
-STREAM NAME 'vl_..._base_customer'
-REJECTED DATA AS TABLE vload_merge.customer_rejects;
+STREAM NAME 'vload_…_merge'
+REJECTED DATA AS TABLE vload.txn_rejects_merge;
 ```
-
-Why this is the fastest path into Vertica:
 
 | Choice | Reason |
 |---|---|
-| `COPY`, not `INSERT` | COPY writes sorted, encoded, compressed ROS containers directly to disk in one transaction. There's no per-row overhead, and since Vertica 10 there's no WOS staging. |
-| Many files per table | Each file is parsed by its own thread (`FILES_PER_TABLE`), so one COPY uses many cores. |
-| 10 COPYs at once | The 10 tables load concurrently from 10 sessions and share the cluster's resources. The runner prints the parallel speed-up for every step. |
+| `COPY`, not `INSERT` | COPY writes sorted, encoded, compressed ROS containers straight to disk in one transaction, with no per-row overhead. |
+| Many files | Each file is parsed by its own thread, so one COPY uses many cores (`JSON_FILES`, default = number of CPUs, at most 24). |
+| `FJSONPARSER(flatten_arrays=true)` + `FILLER` | Maps the nested JSON (the MERCHANT group, the TAG multiple-value field) onto plain columns in the same pass: no landing table, no second `INSERT … SELECT`. See [ADABAS_MAPPING.md](ADABAS_MAPPING.md). |
 | `ON ANY NODE` | On a cluster with shared storage, every node takes part in parsing. |
-| `ZSTD` | Files are ~8x smaller on disk, and decompression costs little CPU next to JSON parsing. |
-| `FJSONPARSER(flatten_arrays=true)` + `FILLER` | Maps the nested JSON (groups, MU and PE arrays) onto plain relational columns in the same pass. There's no landing table and no second `INSERT … SELECT`. |
-| `REJECTED DATA AS TABLE` | Bad records go to a table you can query instead of failing the load. |
-| `STREAM NAME` | Progress shows live in `v_monitor.load_streams` (the runner's progress line uses it). |
-| `COPY_BATCH_FILES` (optional) | A single COPY sorts its whole input before writing ROS containers, so a very large load needs TEMP space close to its final size. Loading N files per COPY in consecutive statements bounds that peak, at the price of more, smaller containers for the Tuple Mover to merge. |
+| `REJECTED DATA AS TABLE` | Bad records go to a table you can query; `apply.sh` stops if there are any. |
+| `STREAM NAME` | The load shows in `v_monitor.load_streams` while it runs. |
 
-The target is the same for every method. Tables are segmented by `HASH(isn)`, sorted by `isn`
-and partitioned by month of the immutable `created_date`.
+The fact table is segmented by `HASH(isn)`, sorted by `isn` and partitioned by month of the
+immutable `created_date`, so an update never moves a row to another partition.
 
 ---
 
-## Method 1 — staging table + partition COPY/SWAP
+## Method 1 — insert-only upsert (journal + Top-K LAP)
 
-**Idea:** never modify the fact table in place. Build the new version of the affected
-partitions next to it, then exchange partitions in a single catalog operation.
-
-```
-dose ─COPY─► delta ──┐
-                     ├─ INSERT…SELECT (unchanged rows of touched partitions + new images) ─► stage
-fact ────────────────┘                                                                      │
-fact ◄──────────── SWAP_PARTITIONS_BETWEEN_TABLES(stage, pmin, pmax, fact) ◄───────────────┘
-```
-
-Base load:
+**Don't UPDATE at all.** Every change is appended to the journal with its change timestamp.
+A **Top-K Live Aggregate Projection** keeps the newest version of every key, and readers use
+a view on it.
 
 ```sql
-CREATE TABLE s.customer_stage LIKE s.customer INCLUDING PROJECTIONS;
-COPY s.customer_stage ( … ) FROM '…/base/*.json.zst' …;
-SELECT MOVE_PARTITIONS_TO_TABLE('s.customer_stage', '190001', '299912', 's.customer');  -- publish
+CREATE TABLE vload.txn_jrn_base ( isn BIGINT NOT NULL, op_code CHAR(1) NOT NULL, change_ts TIMESTAMP NOT NULL, … )
+ORDER BY isn, change_ts
+SEGMENTED BY HASH(isn) ALL NODES
+PARTITION BY ((YEAR(created_date) * 100) + MONTH(created_date));
+
+-- select list: PARTITION BY column, ORDER BY column, then the rest
+CREATE PROJECTION vload.txn_jrn_base_topk (isn, change_ts, op_code, …) AS
+SELECT isn, change_ts, op_code, …
+  FROM vload.txn_jrn_base
+ LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC);
+
+CREATE VIEW vload.txn_upsert_current AS
+SELECT … FROM (SELECT isn, change_ts, … FROM vload.txn_upsert
+               LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC)) last_version
+ WHERE op_code <> 'D';
 ```
 
-Every dose:
+Applying the changes is one statement:
 
 ```sql
--- 1. load the dose
-CREATE TABLE s.customer_delta LIKE s.customer INCLUDING PROJECTIONS;
-COPY s.customer_delta ( … ) FROM '…/dose_01/*.json.zst' …;
+COPY vload.txn_upsert ( … ) FROM '/…/demo/changes/*.json' … ;
+```
 
--- 2. rebuild only the partitions the dose touches (here 2025-11 … 2026-01)
-CREATE TABLE s.customer_stage LIKE s.customer INCLUDING PROJECTIONS;
---    (if untouched partitions lie inside the range: link them in, metadata only)
---    SELECT COPY_PARTITIONS_TO_TABLE('s.customer', '202511', '202601', 's.customer_stage');
---    SELECT DROP_PARTITIONS('s.customer_stage', '202512', '202512');
-INSERT INTO s.customer_stage
-SELECT f.* FROM s.customer f
- WHERE ((created_date >= '2025-11-01' AND created_date < ADD_MONTHS('2025-11-01'::DATE, 1)) OR …)
-   AND NOT EXISTS (SELECT 1 FROM s.customer_delta d WHERE d.isn = f.isn)
+The optimizer answers the view from the LAP. `EXPLAIN` shows
+`STORAGE ACCESS for vload.txn_upsert_topk (Rewritten TOPK)` and `TopK Optimized: K=1`.
+A predicate on the key (`WHERE isn = …` or `isn >= …`) is pushed into the projection scan.
+
+**Why it's fast:** an upsert costs as much as a load. There's no delta table, no join, no
+delete vectors and no locks against readers.
+
+**Data versioning comes free.** The journal holds every version of every key, with times:
+
+```sql
+SELECT isn, op_code, change_ts, batch_id, amount FROM vload.txn_upsert WHERE isn = 950000001 ORDER BY change_ts;
+```
+
+**What it costs**
+
+- The LAP is a second, pre-aggregated copy of the data: about twice the storage, and the
+  COPY does a little more work to maintain it.
+- Reading **all** current rows runs the Top-K operator over the whole LAP: in this demo about
+  3 M rows/s on one node, so a full scan of 1 billion rows takes minutes, while point and
+  range queries on the key stay fast.
+- The journal only grows. Compact it from time to time (every few months):
+
+```sql
+CREATE TABLE vload.txn__new ( … same DDL … );
+CREATE PROJECTION vload.txn__new_topk … LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC);
+INSERT INTO vload.txn__new SELECT * FROM vload.txn_upsert_current;   -- read from the LAP
+COMMIT;
+ALTER TABLE vload.txn_upsert, vload.txn__new RENAME TO txn__old, txn_upsert;   -- atomic
+DROP TABLE vload.txn__old CASCADE;
+```
+
+A minimal walk-through is in [`examples/lap_topk_basic.sql`](../examples/lap_topk_basic.sql).
+
+---
+
+## Method 2 — staging table + partition COPY/SWAP
+
+**Never modify the fact table in place.** Build the new version of the affected partitions
+next to it, then exchange partitions in one catalog operation.
+
+```
+changes ─COPY─► delta ──┐
+                        ├─ INSERT…SELECT (unchanged rows of touched partitions + new images) ─► stage
+fact ───────────────────┘                                                                      │
+fact ◄─────────────── SWAP_PARTITIONS_BETWEEN_TABLES(stage, pmin, pmax, fact) ◄────────────────┘
+```
+
+```sql
+-- 1. load the changes
+CREATE TABLE vload.txn_swap_delta LIKE vload.txn_swap INCLUDING PROJECTIONS;
+COPY vload.txn_swap_delta ( … ) FROM '/…/demo/changes/*.json' … ;
+
+-- 2. which partitions are touched? (here 202511, 202512 and the new 202601)
+SELECT DISTINCT ((YEAR(created_date) * 100) + MONTH(created_date)) FROM vload.txn_swap_delta;
+
+-- 3. rebuild only those partitions, in 11 parallel sessions (one ISN slice each)
+CREATE TABLE vload.txn_swap_stage LIKE vload.txn_swap INCLUDING PROJECTIONS;
+SELECT MIN(isn), MAX(isn) FROM ( … rows of the touched partitions + the delta … ) x;
+INSERT /*+DIRECT*/ INTO vload.txn_swap_stage                -- slice 1 of 11
+SELECT f.* FROM vload.txn_swap f
+ WHERE ((f.created_date >= '2025-11-01' AND f.created_date < ADD_MONTHS('2025-11-01'::DATE, 1)) OR …)
+   AND f.isn BETWEEN 944343067 AND 949448241
+   AND NOT EXISTS (SELECT 1 FROM vload.txn_swap_delta d WHERE d.isn = f.isn)
 UNION ALL
-SELECT * FROM s.customer_delta WHERE op_code <> 'D';
+SELECT * FROM vload.txn_swap_delta WHERE op_code <> 'D' AND isn BETWEEN 944343067 AND 949448241;
+COMMIT;
 
--- 3. publish atomically
-SELECT SWAP_PARTITIONS_BETWEEN_TABLES('s.customer_stage', '202511', '202601', 's.customer');
-DROP TABLE s.customer_stage, s.customer_delta;
+-- 4. publish atomically
+SELECT SWAP_PARTITIONS_BETWEEN_TABLES('vload.txn_swap_stage', '202511', '202601', 'vload.txn_swap');
+DROP TABLE vload.txn_swap_stage, vload.txn_swap_delta;
 ```
 
-**Why it's fast and clean**
+**Why it's clean:** partition functions change only the catalog, the fact table never gets
+delete vectors, and readers see the old or the new partitions, never a half-applied change.
 
-- Partition functions (`MOVE_`, `COPY_`, `SWAP_PARTITIONS…`) change only the catalog. They
-  take milliseconds for any volume.
-- Updates and deletes become one sequential `INSERT … SELECT` with a local merge anti-join.
-  The fact table never gets delete vectors, so it never needs a purge.
-- Readers see the old or the new partitions, never a half-applied dose.
-- Deletes are real deletes: the rows are simply not rewritten.
-
-**What it costs:** the rebuild rewrites every row of the touched partitions, not just the
-changed ones. That's cheap when changes cluster in recent partitions, which is typical for CDC
-on transactional data (`HOT_PCT` controls this in the demo). It becomes expensive when every
-dose touches every partition.
+**What it costs:** the rebuild rewrites **every row of the touched partitions**, not just the
+changed ones. In this demo the updates hit the newest 5 % of the table (`HOT_PCT`), which
+spans two monthly partitions of ~28 M rows each, so ~56 M rows are rewritten to apply 1 M
+changes. Several sessions can insert into the same table at once, so `apply.sh` splits the
+rebuild into ISN slices (`REBUILD_SESSIONS`, default = half the CPUs): one session needed
+44 s for the rebuild, 11 sessions need 13 s. The method shines when changes are concentrated
+and partitions are small, and it loses when changes are spread over the whole table.
 
 **Rules**
 
-- The partition key must be **immutable**, like a creation date or an ISN range. Otherwise an
-  update can move a row to another partition and leave the old image behind.
-- Stage and fact tables need identical columns, partitioning and projections. Use
+- The partition key must be **immutable** (a creation date, an ISN range). Otherwise an
+  update could move a row to another partition and leave the old image behind.
+- Stage and fact tables need identical columns, partitioning and projections:
   `LIKE … INCLUDING PROJECTIONS`.
-- `SWAP_PARTITIONS_BETWEEN_TABLES` swaps the **whole key range**. Every partition inside
-  `[pmin, pmax]` must therefore be present in the stage table, which is why untouched ones are
-  linked in with `COPY_PARTITIONS_TO_TABLE`.
+- `SWAP_PARTITIONS_BETWEEN_TABLES` swaps the **whole key range**. If untouched partitions lie
+  inside `[pmin, pmax]`, link them into the stage table first with
+  `COPY_PARTITIONS_TO_TABLE` (metadata only); `apply.sh` does this automatically.
 
 ---
 
-## Method 2 — optimized MERGE
+## Method 3 — optimized MERGE
 
-**Idea:** load each dose into a delta table shaped exactly like the target, then apply it with
-one `MERGE` that Vertica can run through its optimized plan.
+**Load the changes into a delta table shaped like the target, then apply them with one MERGE
+that Vertica can run through its optimized plan.**
 
 ```sql
-CREATE TABLE s.customer_delta LIKE s.customer INCLUDING PROJECTIONS;
-COPY s.customer_delta ( … ) FROM '…/dose_01/*.json.zst' …;
+CREATE TABLE vload.txn_merge_delta LIKE vload.txn_merge INCLUDING PROJECTIONS;
+COPY vload.txn_merge_delta ( … ) FROM '/…/demo/changes/*.json' … ;
 
-MERGE INTO s.customer t
-USING s.customer_delta s
+MERGE INTO vload.txn_merge t
+USING vload.txn_merge_delta s
    ON t.isn = s.isn
  WHEN MATCHED THEN UPDATE SET
     isn = s.isn, op_code = s.op_code, change_ts = s.change_ts, … every column …
@@ -141,11 +196,11 @@ COMMIT;
 **The optimization rules** (all three must hold):
 
 1. The target's join column has a `PRIMARY KEY` or `UNIQUE` constraint. A declared,
-   **not enforced** (`DISABLED`) key is enough and adds no load cost.
+   **not enforced** (`DISABLED`) key is enough and costs nothing at load time.
 2. `UPDATE SET` and `INSERT` list **every** column of the target.
 3. Both use the **same** source values.
 
-How to prove it: the runner prints the `EXPLAIN` of each MERGE.
+`apply.sh` prints the `EXPLAIN` of the MERGE on the first run:
 
 | Plan | What you see |
 |---|---|
@@ -154,111 +209,48 @@ How to prove it: the runner prints the `EXPLAIN` of each MERGE.
 
 Leave one column out of `UPDATE SET` and the plan falls back to the generic MERGE.
 
-**Why it's fast**
-
-- The delta table is created `LIKE … INCLUDING PROJECTIONS`, so it has the same segmentation
-  (`HASH(isn)`) and sort order (`isn`) as the target. The join is local and presorted: no
-  network shuffle, no hash table, no sort.
-- The cost is proportional to the dose, not to the table.
+**Why it's fast:** the delta has the target's segmentation and sort order, so the join is a
+local, presorted merge join. The cost follows the number of changes, not the table size.
 
 **What it costs**
 
-- An update is a delete plus an insert. Every updated row leaves a **delete vector** in the
-  target (the demo reports the count). The Tuple Mover's mergeout purges them over time, or
-  you can run `PURGE_TABLE()`. Many delete vectors slow scans until they're purged.
-- Duplicate keys in one dose make MERGE fail. Compact the dose to the last image per key
+- An update is a delete plus an insert: every updated row leaves a **delete vector** in the
+  target (`apply.sh` reports the count). The Tuple Mover purges them over time, or run
+  `PURGE_TABLE()`.
+- Duplicate keys in one batch make MERGE fail: compact the batch to the last image per key
   first, for example with `LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC)`.
-- To keep one statement for inserts, updates and deletes, deletes are **soft**
-  (`op_code = 'D'`) and a view (`customer_current`) hides them.
+- Deletes, if the change files carry any (`CHANGE_MIX`), are kept as `op_code = 'D'` rows
+  that the current view hides, so one MERGE handles everything.
 
 ---
 
-## Method 3 — insert-only journal + Top-K Live Aggregate Projection
+## Repeatable runs: COPY_TABLE
 
-**When an optimized MERGE is not possible, don't UPDATE or DELETE at all.** Every CDC
-image, including deletes (as tombstones), is appended to the base (anchor) table with its
-change timestamp. A **Top-K Live Aggregate Projection** keeps the newest version per key:
-
-```sql
-CREATE TABLE s.customer ( isn BIGINT NOT NULL, op_code CHAR(1), change_ts TIMESTAMP, … )
-ORDER BY isn, change_ts
-SEGMENTED BY HASH(isn) ALL NODES
-PARTITION BY ((YEAR(created_date) * 100) + MONTH(created_date));
-
--- select list: PARTITION BY column, ORDER BY column, then the rest
-CREATE PROJECTION s.customer_topk ( isn, change_ts, op_code, … ) AS
-SELECT isn, change_ts, op_code, …
-  FROM s.customer
- LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC);
-
-CREATE VIEW s.customer_current AS
-SELECT … FROM (SELECT isn, change_ts, … FROM s.customer
-               LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC)) last_version
- WHERE op_code <> 'D';
-```
-
-Applying a dose is just:
+`apply.sh` can run any number of times and every run starts from the same data. Before each
+method it resets the method's table from the pristine copy made by `generate.sh`:
 
 ```sql
-COPY s.customer ( … ) FROM '…/dose_01/*.json.zst' …;
+DROP TABLE IF EXISTS vload.txn_merge, vload.txn_merge_delta, vload.txn_rejects_merge CASCADE;
+SELECT COPY_TABLE('vload.txn_base', 'vload.txn_merge');
 ```
 
-The optimizer answers the view from the LAP. `EXPLAIN` shows
-`STORAGE ACCESS for s.customer_topk (Rewritten TOPK)` and `TopK Optimized: K=1`.
-
-A minimal walk-through is in [`examples/lap_topk_basic.sql`](../examples/lap_topk_basic.sql).
-
-**Why it's useful**
-
-- Applying a dose is as fast as loading new data. There's no delta table, no join, no delete
-  vectors and no locks against readers.
-- **Data versioning comes free.** The anchor table holds the full insert, update and delete
-  history of every key, with times, for audit and debugging:
-  ```sql
-  SELECT isn, op_code, change_ts, batch_id FROM s.customer WHERE isn = 951 ORDER BY change_ts;
-  ```
-- It works even when MERGE's rules can't be met, for example with no usable key, duplicate
-  images per key in one dose, or a source that sends partial rows.
-
-**What it costs**
-
-- The LAP is a second, pre-aggregated copy of the data, so storage is about 2x at first and
-  the load does a little more work.
-- The anchor table only grows. Hidden old versions still take space until you purge.
-- The anchor table can't be UPDATEd or DELETEd while the LAP exists. That's by design.
-
-**Purging the journal (every few months)**
-
-```sql
--- Step 1: new table (+ its LAP, empty) filled with the latest live version of every key
-CREATE TABLE s.customer__new ( … same DDL … );
-CREATE PROJECTION s.customer__new_topk … LIMIT 1 OVER (PARTITION BY isn ORDER BY change_ts DESC);
-INSERT INTO s.customer__new SELECT * FROM s.customer_current;   -- read from the LAP
-COMMIT;
--- Step 2: atomic swap of the names (instead of DROP + RENAME: no moment without a table)
-ALTER TABLE s.customer, s.customer__new RENAME TO customer__old, customer;
--- Step 3: drop the old journal with its projections and LAP
-DROP TABLE s.customer__old CASCADE;
--- Step 4: the LAP already exists: it was created empty in step 1 and filled by the INSERT
-```
-
-Run it with `./vload.sh purge --scale <S>`. Then carry on INSERTing into the base table as
-usual. Vertica renames `<table>_super` and `<table>_topk` together with the table.
+`COPY_TABLE` copies the definition, the projections (including a Top-K LAP), the constraints
+and the statistics, and **shares** the storage containers of the source instead of copying
+data. It takes milliseconds for a billion rows and no disk space until the copy is changed.
+This reset is not part of the measured time.
 
 ---
 
 ## Choosing a method
 
-| | Swap partitions | Optimized MERGE | Journal + Top-K LAP |
+| | Upsert (journal + Top-K LAP) | Swap partitions | Optimized MERGE |
 |---|---|---|---|
-| Best when | changes cluster in few (recent) partitions; readers need atomic, all-or-nothing publication | changes are spread across the table; dose is small compared to the table | MERGE can't be optimized, or history/audit of every version is needed |
-| Apply cost grows with | size of the **touched partitions** | size of the **dose** | size of the **dose** (append only) |
-| Delete vectors | none | one per updated or deleted row | none |
-| Deletes | physical | soft (`op_code='D'`) | tombstone version |
-| Storage | 1x | 1x (+ delete vectors until purged) | about 2x (anchor + LAP) + history |
-| History of changes | no | no | yes, every version |
-| Housekeeping | none | Tuple Mover / `PURGE_TABLE` | periodic journal purge |
-| Extra disk while applying | touched partitions (stage) | delta table | none; the purge needs old + new copy of a table |
-| Readers during apply | never blocked; switch atomically at the swap | never blocked (snapshot reads); other writers wait for MERGE's X lock | never blocked |
+| Best when | the change rate is high, MERGE can't be optimized, or history is needed | changes cluster in few, small partitions; readers need all-or-nothing publication | changes are spread out and small compared to the table |
+| Apply cost grows with | number of changes (append only) | size of the **touched partitions** | number of changes |
+| Delete vectors | none | none | one per updated row |
+| Storage | about 2x (journal + LAP) + history | 1x | 1x (+ delete vectors until purged) |
+| Reading all current rows | Top-K at query time (slower) | plain scan | plain scan (+ delete vectors) |
+| History of changes | yes, every version | no | no |
+| Housekeeping | periodic journal compaction | none | Tuple Mover / `PURGE_TABLE` |
 
 Measured results are in [`RESULTS.md`](RESULTS.md).
