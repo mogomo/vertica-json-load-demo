@@ -24,6 +24,9 @@ load_config() {
     : "${JSON_FILES:=auto}"                # change files = COPY parse threads
     : "${GEN_SESSIONS:=auto}"              # parallel INSERT sessions while generating
     : "${REBUILD_SESSIONS:=auto}"          # parallel sessions of the swap rebuild
+    : "${MULTI_ROWS:=60M}"                 # multi-table phase: rows of each of the 9 other tables
+    : "${MULTI_JSON_FILES:=8}"             # multi-table phase: JSON files per table
+    : "${PARALLEL:=10}"                    # multi-table phase: tables loaded at the same time
     : "${COPY_NODE_CLAUSE:=ON ANY NODE}"
     : "${RESOURCE_POOL:=}"
     : "${SQL_PREVIEW_LINES:=40}"           # 0 = always print the full statement
@@ -31,10 +34,12 @@ load_config() {
     NCPU=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)
     BASE_ROWS=$(parse_count "$BASE_ROWS")
     CHANGE_ROWS=$(parse_count "$CHANGE_ROWS")
+    MULTI_ROWS=$(parse_count "$MULTI_ROWS")
     [[ $JSON_FILES == auto ]] && JSON_FILES=$(( NCPU < 24 ? NCPU : 24 ))
     [[ $GEN_SESSIONS == auto ]] && GEN_SESSIONS=$(( NCPU / 2 > 1 ? NCPU / 2 : 1 ))
     [[ $REBUILD_SESSIONS == auto ]] && REBUILD_SESSIONS=$GEN_SESSIONS
     CHANGES_DIR="$DEMO_DIR/changes"
+    MULTI_DIR="$DEMO_DIR/multi"
     export VSQL_HOST VSQL_PORT VSQL_USER VSQL_PASSWORD VSQL_DATABASE
 }
 
@@ -241,4 +246,62 @@ timed_parallel() {
     LAST_MS=$(( end - start ))
     (( rc == 0 )) || die "$label failed — see ${logp#"$ROOT_DIR"/}_*.err"
     printf '  %s⏱%s  %-44s %s%8s s%s  (%d parallel sessions)\n' "$C_GREEN" "$C_RESET" "$label" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" "$n"
+}
+
+# ----------------------------------------------------------------- generation
+# partition_plan <rows> : one line per monthly partition of a table of <rows>
+# rows whose created_date = START_DATE + (isn - 1) * SPAN_DAYS / rows:
+#   label first_day next_month_first_day first_isn last_isn
+partition_plan() {
+    awk -v start="$START_DATE" -v span="$SPAN_DAYS" -v n="$1" -f /dev/stdin <<'AWK'
+function dfc(y, m, d,    era, yoe, doy, doe) {            # days since 1970-01-01
+    if (m <= 2) y--
+    era = int((y >= 0 ? y : y - 399) / 400); yoe = y - era * 400
+    doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+    doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+    return era * 146097 + doe - 719468
+}
+function ceil_div(a, b) { return int((a + b - 1) / b) }
+BEGIN {
+    y = substr(start, 1, 4) + 0; m = substr(start, 6, 2) + 0; s0 = dfc(y, m, substr(start, 9, 2) + 0)
+    while (1) {
+        ny = y + (m == 12); nm = (m == 12) ? 1 : m + 1
+        d0 = dfc(y, m, 1) - s0; d1 = dfc(ny, nm, 1) - s0
+        if (d0 >= span) break
+        if (d0 < 0) d0 = 0
+        if (d1 > span) d1 = span
+        lo = ceil_div(d0 * n, span) + 1; hi = ceil_div(d1 * n, span)
+        if (lo <= hi) printf "%04d%02d %04d-%02d-01 %04d-%02d-01 %d %d\n", y, m, y, m, ny, nm, lo, hi
+        y = ny; m = nm
+    }
+}
+AWK
+}
+
+# run_jobs <label> <sql function> <rows> <log prefix> <sessions> <unit>
+#   Runs "<fn> <job line words> | vsql" for every line of the JOBS array, at
+#   most <sessions> at a time, with a live progress line. <rows> is only used
+#   for the rows/s figure.
+run_jobs() {
+    local label=$1 fn=$2 rows=$3 logp=$4 sessions=$5 unit=$6 line running=0 done_n=0 total start fails=0 j=0
+    total=${#JOBS[@]}
+    start=$(now_ms)
+    _progress() { (( IS_TTY )) && printf '\r  %s%-44s %3d/%d %s  %8s s%s' "$C_CYAN" "$label" "$done_n" "$total" "$unit" "$(secs $(( $(now_ms) - start )))" "$C_RESET"; return 0; }
+    for line in "${JOBS[@]}"; do
+        j=$((j + 1))
+        # shellcheck disable=SC2086
+        ( set -- $line; "$fn" "$@" | vsql_exec "${logp}_$(printf '%03d' "$j")" >/dev/null ) &
+        running=$((running + 1))
+        while (( running >= sessions )); do
+            wait -n || fails=$((fails + 1)); running=$((running - 1)); done_n=$((done_n + 1)); _progress
+        done
+    done
+    while (( running > 0 )); do
+        wait -n || fails=$((fails + 1)); running=$((running - 1)); done_n=$((done_n + 1)); _progress
+    done
+    (( IS_TTY )) && printf '\r\033[K'
+    LAST_MS=$(( $(now_ms) - start ))
+    (( fails == 0 )) || die "$label: $fails job(s) failed — see ${logp#"$ROOT_DIR"/}_*.err"
+    printf '  %s⏱%s  %-44s %s%8s s%s  (%s %s, %s sessions, %s rows/s)\n' "$C_GREEN" "$C_RESET" "$label" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" \
+        "$total" "$unit" "$sessions" "$(rate "$rows" "$LAST_MS")"
 }

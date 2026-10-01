@@ -1,5 +1,7 @@
 # Results
 
+Phase 1: one 1-billion-row table, three methods. Phase 2: ten tables in parallel.
+
 ## Test system
 
 - Vertica 26.2 Community Edition, **single node**
@@ -90,10 +92,72 @@ table in 0.04–0.11 s and uses no extra disk: the method tables share the stora
 GB). Note that `v_monitor.projection_storage` counts shared containers once per table, so it
 reports ~38 GB for each copy.
 
+## Phase 2: 10 tables in parallel
+
+The 1-billion-row `txn` table plus 9 more ADABAS files of 60,000,000 rows each (customer,
+account, card, loan, payment, policy, claim, employees, vehicles: groups, multiple-value fields
+and periodic groups, see [ADABAS_MAPPING.md](ADABAS_MAPPING.md)). Every table receives
+1,000,000 multi-level JSON changes (500,000 updates + 500,000 inserts): 10,000,000 changes in
+all. Each table runs its own pipeline, COPY of its JSON files into a delta table, then an
+optimized MERGE, and `--parallel` sets how many pipelines run at once.
+
+`./generate_multi.sh` built the 9 tables (540M rows, 27 GB) in 2 min 14 s at 4.4M rows/s,
+and the 9M JSON records (72 files, 3.3 GB) in 8 s.
+
+`./apply_multi.sh --parallel 10,5,1 --runs 3`. The wall-clock runs from the start of the first
+COPY to the commit of the last MERGE:
+
+<!-- multi:begin -->
+| Tables at a time | Wall-clock (avg) | Runs | JSON rows/s | vs one at a time |
+|---|---:|---|---:|---:|
+| **10** (all in parallel) | **12.24 s** | 12.50 / 12.42 / 11.81 s | 817K | 2.3x |
+| 5 (a new table starts when one finishes) | 12.88 s | 13.18 / 12.98 / 12.47 s | 777K | 2.2x |
+| 1 (one after the other) | 28.20 s | 28.30 / 28.27 / 28.04 s | 355K | 1.0x |
+
+Per table, average of 3 runs (parse + load / MERGE / total, in seconds):
+
+| Table | Rows | 1 at a time | 5 at a time | 10 at a time |
+|---|---:|---:|---:|---:|
+| txn | 1,000,000,000 | 1.36 / 0.92 / **2.28** | 3.78 / 1.44 / **5.22** | 6.32 / 2.46 / **8.78** |
+| customer | 60,000,000 | 2.31 / 2.03 / **4.34** | 5.45 / 4.52 / **9.97** | 9.52 / 2.67 / **12.19** |
+| account | 60,000,000 | 1.72 / 0.68 / **2.40** | 4.59 / 1.14 / **5.73** | 8.25 / 1.67 / **9.92** |
+| card | 60,000,000 | 1.79 / 0.71 / **2.51** | 4.66 / 1.48 / **6.14** | 8.63 / 1.63 / **10.26** |
+| loan | 60,000,000 | 1.85 / 0.69 / **2.54** | 4.49 / 1.18 / **5.67** | 8.50 / 1.73 / **10.23** |
+| payment | 60,000,000 | 1.88 / 1.83 / **3.71** | 4.35 / 2.96 / **7.31** | 9.42 / 2.57 / **11.99** |
+| policy | 60,000,000 | 1.84 / 0.71 / **2.55** | 4.07 / 1.26 / **5.33** | 8.91 / 1.54 / **10.45** |
+| claim | 60,000,000 | 1.74 / 0.66 / **2.40** | 3.97 / 1.20 / **5.16** | 8.72 / 1.49 / **10.21** |
+| employees | 60,000,000 | 2.08 / 0.98 / **3.06** | 4.32 / 1.42 / **5.74** | 9.50 / 1.52 / **11.02** |
+| vehicles | 60,000,000 | 1.67 / 0.69 / **2.36** | 2.14 / 0.76 / **2.90** | 8.51 / 1.65 / **10.15** |
+<!-- multi:end -->
+
+Every run of every setting passed the check: each table holds its base rows plus the 500,000
+inserts, exactly 1,000,000 rows carry the new batch, and their checksum over all columns equals
+the checksum of the JSON rows.
+
+### What it means
+
+- **Parallel pays: 28.2 s → 12.2 s** for 10 million JSON changes in 10 tables, 2.3 times
+  faster than one table after the other.
+- **10 at a time vs 5 at a time makes little difference** (12.2 s vs 12.9 s). The bottleneck is
+  JSON parsing: one COPY already parses its files with several threads (8 files per table,
+  22 for txn), so with five tables at once the 22 cores are already busy. Beyond that,
+  extra concurrency only stretches each table's time (2.3 → 8.8 s for txn) while the total
+  stays the same. On this machine the ceiling is about **800,000 parsed and merged JSON rows
+  per second**.
+- So 10 in parallel is not "too heavy": it is safe and slightly faster, with every MERGE
+  still on the optimized plan. Five at a time is a good choice when other work shares the
+  database, since it gives the same throughput with half the sessions and memory.
+- The size of the target hardly matters: the MERGE of 1M changes into the 1B-row table took
+  0.92 s, against 0.66–2.03 s for the 60M-row tables. The cost follows the changes and the
+  width of the records (customer and payment, with the most columns and nested arrays, are the
+  slowest).
+
 ## Reproduce
 
 ```bash
 ./generate.sh              # ~12 min, ~116 GB in Vertica
 ./apply.sh --runs 3        # ~2.5 min including the checks
 ./apply.sh --full-check    # optional: compare all 1 billion current rows (~6 min)
+./generate_multi.sh        # ~2.5 min, ~27 GB in Vertica + 3.3 GB of JSON
+./apply_multi.sh --parallel 10,5,1 --runs 3
 ```

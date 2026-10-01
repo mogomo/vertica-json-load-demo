@@ -52,6 +52,45 @@ The base table itself is not loaded from JSON: its billion rows are generated in
 with SQL, as the same columns. Only the changes travel as JSON, and parsing them is part of
 the measured time.
 
+## The 10 files of phase 2
+
+Phase 2 (`generate_multi.sh`, `apply_multi.sh`) adds nine banking, insurance and classic ADABAS
+demo files next to TXN. They're defined in [`conf/tables.def`](../conf/tables.def), which
+drives the JSON generator, the DDL, the SQL row generator, the COPY mapping and the MERGE:
+
+| # | File | Table | Rows | Hierarchy |
+|---|---|---|---:|---|
+| 11 | Customer | `customer` | 60M | group NAME, MU PHONE (3), PE ADDRESS (2) |
+| 12 | Account | `account` | 60M | group BALANCE, MU SIGNATORY (3) |
+| 13 | Card | `card` | 60M | group LIMITS, PE TOKEN (2) |
+| 14 | Loan | `loan` | 60M | group TERMS, PE COLLATERAL (2) |
+| 15 | Payment | `payment` | 60M | groups DEBTOR / CREDITOR, MU REMITTANCE (2) |
+| 16 | Transaction | `txn` | 1B | group MERCHANT, MU TAG (2): the fact table of phase 1 |
+| 17 | Policy | `policy` | 60M | group PREMIUM, PE COVERAGE (2), MU BENEFICIARY (2) |
+| 18 | Claim | `claim` | 60M | group INCIDENT, PE PAYOUT (2) |
+| 19 | Employees | `employees` | 60M | groups FULL-NAME / FULL-ADDRESS, MU LANG (2), PE INCOME (2) |
+| 20 | Vehicles | `vehicles` | 60M | group MAKE-MODEL, MU SERVICE-DATE (3) |
+
+A customer change record nests three levels deep (`rec` → `address` array → object):
+
+```json
+{"hdr":{"isn":57007920,"op":"U","ts":"2026-01-01 00:00:00.000000","batch":1},
+ "rec":{"created":"2025-11-07","cust_no":"CU0057007920",
+        "name":{"first":"Thomas","last":"Wilson"},                                  <- group
+        "birth_date":"1967-03-24","segment":"P","risk_score":20,
+        "email":"sarah.57007920@mail.example",
+        "phone":["+95-057-8793394",null,null],                                      <- MU field
+        "address":[{"type":"W","street":"5 Ivanov ST","city":"BOSTON","country":"AT"},
+                   {"type":"H","street":"13 Schneider BLVD","city":"VIENNA","country":"IE"}]}}   <- PE group
+```
+
+A line of `tables.def` looks like this:
+
+```
+F|customer|address.1.city|addr2_city|VARCHAR(30)|city?50
+   table   JSON path      column     type        generator (50 % NULL)
+```
+
 ## Flattening in the COPY
 
 The hierarchy is flattened **during** the COPY, with no landing table:

@@ -1,12 +1,12 @@
 # Video: 1 million JSON changes into 1 billion rows, three ways
 
 A short animated video (Manim) with a recorded voice-over and screenshots of a real run.
-Target length: about 5 minutes.
+Target length: about 6½ minutes.
 
 ## Narration
 
 Read it straight through, without pauses; the scenes are cut to the audio afterwards.
-About 690 words: 4½ to 5 minutes at a calm pace.
+About 900 words: 6 to 6½ minutes at a calm pace.
 
 > A mainframe ADABAS system sends its changes as hierarchical JSON. Every batch holds one
 > million records: half of them update rows that already exist, and half of them are new
@@ -50,6 +50,23 @@ About 690 words: 4½ to 5 minutes at a calm pace.
 > computes a checksum. All three methods produce exactly the same data, down to the last of
 > one billion and five hundred thousand rows.
 >
+> Now let's scale out. A real offload has more than one file. So we add nine more ADABAS
+> files, customers, accounts, cards, loans, payments, policies, claims, employees and
+> vehicles, with sixty million rows each, next to the billion-row transaction table. Every one
+> of the ten tables receives one million multi-level JSON changes: groups, multiple-value
+> fields, and periodic groups, which are arrays of objects. That is ten million changes in
+> all. Each table gets its own pipeline: a COPY that parses its JSON into a delta table, and an
+> optimized MERGE. And because the tables are independent, the pipelines can run side by side.
+>
+> One table after the other, the ten tables take twenty-eight seconds. All ten in parallel:
+> twelve point two seconds, more than twice as fast. Five at a time: twelve point nine
+> seconds, almost the same. Why so close? Because parsing JSON is the real work, and each COPY
+> already parses its files on many threads. With five tables at once, all twenty-two cores are
+> busy, and the machine moves about eight hundred thousand JSON rows per second, whichever way
+> we split the work. Ten at a time is not too heavy; five at a time gives the same throughput
+> with half the sessions. And every table passes its check: the rows changed in the table match
+> the JSON rows exactly.
+>
 > So, which method should you choose? When the changes are a small slice of a big table,
 > the optimized MERGE and the insert-only upsert are equally fast, and most of the time is
 > spent parsing the JSON. Choose MERGE when you want one copy of the data and you can meet
@@ -75,6 +92,7 @@ The timings in brackets are approximate; cut them to the recorded audio.
 | 5 | "Every method begins with the same COPY…" | 22 files → 22 parser threads → one table; stopwatch starts | the COPY SQL with FILLER columns |
 | 6 | "Here are the results…" | bar chart builds bar by bar: 2.12 s, 2.21 s, 15.89 s (parse+load vs apply stacked) | the RESULTS table of `./apply.sh --runs 3` |
 | 7 | "And the results are correct…" | three checksums slide together and match; "1,000,500,000 rows ✔" | the "check of run" panel |
+| 7b | "Now let's scale out…" | 10 table icons (one big, nine smaller) each fed by its own JSON stream; a race: 10 bars in parallel vs 10 bars in a row; wall-clock 28.2 s → 12.2 s, 5 at a time 12.9 s; CPU meter at 100 % | the RESULTS table of `./apply_multi.sh --parallel 10,5,1 --runs 3` |
 | 8 | "So, which method should you choose?" | decision matrix: best when / cost grows with / storage / history | – |
 | 9 | "The scripts, the SQL and the results…" | repository URL, title card | – |
 
@@ -86,4 +104,6 @@ Use a terminal at least 120 columns wide, a dark theme and a large font.
 ./generate.sh                        # off camera (~12 min), or show the end of its output
 ./apply.sh --pause                   # one run, Enter before every step: WHAT / WHY / SQL panels
 ./apply.sh --runs 3                  # the results table
+./generate_multi.sh                  # off camera (~2.5 min)
+./apply_multi.sh --parallel 10,5,1 --runs 3   # the 10-table results table
 ```

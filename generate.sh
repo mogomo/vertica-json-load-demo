@@ -41,61 +41,6 @@ RUN_LOG="$LOG_DIR/generate_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RUN_LOG" "$DEMO_DIR"
 DEMO_DIR=$(cd "$DEMO_DIR" && pwd); CHANGES_DIR="$DEMO_DIR/changes"   # COPY needs absolute paths
 
-# ---------------------------------------------------------------- the plan
-# one line per monthly partition: label first_day next_month_first_day first_isn last_isn
-partition_plan() {
-    awk -v start="$START_DATE" -v span="$SPAN_DAYS" -v n="$BASE_ROWS" -f /dev/stdin <<'AWK'
-function dfc(y, m, d,    era, yoe, doy, doe) {            # days since 1970-01-01
-    if (m <= 2) y--
-    era = int((y >= 0 ? y : y - 399) / 400); yoe = y - era * 400
-    doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
-    doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
-    return era * 146097 + doe - 719468
-}
-function ceil_div(a, b) { return int((a + b - 1) / b) }
-BEGIN {
-    y = substr(start, 1, 4) + 0; m = substr(start, 6, 2) + 0; s0 = dfc(y, m, substr(start, 9, 2) + 0)
-    while (1) {
-        ny = y + (m == 12); nm = (m == 12) ? 1 : m + 1
-        d0 = dfc(y, m, 1) - s0; d1 = dfc(ny, nm, 1) - s0
-        if (d0 >= span) break
-        if (d0 < 0) d0 = 0
-        if (d1 > span) d1 = span
-        lo = ceil_div(d0 * n, span) + 1; hi = ceil_div(d1 * n, span)
-        if (lo <= hi) printf "%04d%02d %04d-%02d-01 %04d-%02d-01 %d %d\n", y, m, y, m, ny, nm, lo, hi
-        y = ny; m = nm
-    }
-}
-AWK
-}
-
-# run_parallel <label> <sql function> : runs "<fn> <plan line>" for every
-# partition, GEN_SESSIONS sessions at a time, with a live progress line
-run_parallel() {
-    local label=$1 fn=$2 line running=0 done_n=0 total start fails=0
-    local -a plan
-    mapfile -t plan < <(partition_plan)
-    total=${#plan[@]}
-    start=$(now_ms)
-    progress() { (( IS_TTY )) && printf '\r  %s%-44s %3d/%d partitions  %8s s%s' "$C_CYAN" "$label" "$done_n" "$total" "$(secs $(( $(now_ms) - start )))" "$C_RESET"; return 0; }
-    for line in "${plan[@]}"; do
-        # shellcheck disable=SC2086
-        ( set -- $line; "$fn" "$@" | vsql_exec "$RUN_LOG/${fn}_$1" >/dev/null ) &
-        running=$((running + 1))
-        while (( running >= GEN_SESSIONS )); do
-            wait -n || fails=$((fails + 1)); running=$((running - 1)); done_n=$((done_n + 1)); progress
-        done
-    done
-    while (( running > 0 )); do
-        wait -n || fails=$((fails + 1)); running=$((running - 1)); done_n=$((done_n + 1)); progress
-    done
-    (( IS_TTY )) && printf '\r\033[K'
-    LAST_MS=$(( $(now_ms) - start ))
-    (( fails == 0 )) || die "$label: $fails partition(s) failed — see ${RUN_LOG#"$ROOT_DIR"/}/*.err"
-    printf '  %s⏱%s  %-44s %s%8s s%s  (%s partitions, %s sessions, %s rows/s)\n' "$C_GREEN" "$C_RESET" "$label" "$C_BOLD" "$(secs "$LAST_MS")" "$C_RESET" \
-        "$total" "$GEN_SESSIONS" "$(rate "$BASE_ROWS" "$LAST_MS")"
-}
-
 gen_partition()  { sql_generate "$4" "$5" "$1"; }
 fill_partition() { sql_fill_journal "$2" "$3" "$1"; }
 
@@ -139,15 +84,16 @@ $(sql_create_seq)"
       echo "CREATE SCHEMA IF NOT EXISTS ${SCHEMA};"; sql_create_seq; } | timed "number table" "$RUN_LOG/seq"
 
     local p1
-    p1=$(partition_plan | head -1)
+    p1=$(partition_plan "$BASE_ROWS" | head -1)
     explain_step 2 "The fact table: $(fmt_num "$BASE_ROWS") rows, one monthly partition per INSERT" \
-        "Creates txn_base (ADABAS file TXN: account transactions) and fills its $(partition_plan | wc -l | tr -d ' ') monthly partitions with $GEN_SESSIONS parallel INSERT … SELECT sessions. The ISN is the primary key (declared, not enforced), the sort key and the segmentation key." \
+        "Creates txn_base (ADABAS file TXN: account transactions) and fills its $(partition_plan "$BASE_ROWS" | wc -l | tr -d ' ') monthly partitions with $GEN_SESSIONS parallel INSERT … SELECT sessions. The ISN is the primary key (declared, not enforced), the sort key and the segmentation key." \
         "Writing one whole partition per statement gives one sorted ROS container per partition, so the Tuple Mover has nothing to merge afterwards and the timings that follow are stable. Partitions are months of the immutable created_date: an update never moves a row to another partition." \
         "$(sql_create_fact txn_base)
 
 $(set -- $p1; sql_generate "$4" "$5" "$1")"
     sql_create_fact txn_base | timed "create txn_base" "$RUN_LOG/create_base"
-    run_parallel "generate txn_base" gen_partition
+    mapfile -t JOBS < <(partition_plan "$BASE_ROWS")
+    run_jobs "generate txn_base" gen_partition "$BASE_ROWS" "$RUN_LOG/gen" "$GEN_SESSIONS" "partitions"
 
     explain_step 3 "The same rows as an insert-only journal with a Top-K LAP" \
         "Creates txn_jrn_base, sorted by (isn, change_ts), with a Top-K Live Aggregate Projection that keeps the newest version of every ISN, and copies txn_base into it, one partition per INSERT." \
@@ -156,7 +102,7 @@ $(set -- $p1; sql_generate "$4" "$5" "$1")"
 
 $(set -- $p1; sql_fill_journal "$2" "$3" "$1")"
     sql_create_journal txn_jrn_base | timed "create txn_jrn_base + Top-K LAP" "$RUN_LOG/create_jrn"
-    run_parallel "fill txn_jrn_base (+ LAP)" fill_partition
+    run_jobs "fill txn_jrn_base (+ LAP)" fill_partition "$BASE_ROWS" "$RUN_LOG/fill" "$GEN_SESSIONS" "partitions"
 
     explain_step 4 "Optimizer statistics" \
         "ANALYZE_STATISTICS on both tables." \
