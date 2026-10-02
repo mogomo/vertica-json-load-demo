@@ -125,6 +125,8 @@ phase2.sh / phase3.sh  (per run, per --parallel setting)
 - **Repeatable:** `COPY_TABLE` resets a table in milliseconds without copying data, so every
   run of every phase starts from exactly the same rows.
 - **The methods:** reasoning, SQL and pitfalls in [docs/METHODS.md](docs/METHODS.md).
+- **The video:** *Three ways to update data in Vertica* walks through the three methods and
+  the three phases in 13 minutes; its transcript: [docs/VIDEO_TRANSCRIPT.md](docs/VIDEO_TRANSCRIPT.md).
 
 ## Which method, when?
 
@@ -174,7 +176,7 @@ lib/gen_changes.awk    phase 1 JSON records (portable awk)
 lib/gen_json.awk       multi-level JSON records for any table of tables.def
 lib/gen_docs.awk       the phase 2 and phase 3 shapes of the same records
 examples/              standalone SQL (Top-K LAP basics)
-docs/                  methods, ADABAS mapping, results, video script
+docs/                  methods, ADABAS mapping, results, video transcript
 ```
 
 ## Requirements
