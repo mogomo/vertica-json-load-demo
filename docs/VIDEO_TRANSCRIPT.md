@@ -5,6 +5,8 @@
 The narration of the video (13 minutes), which walks through this repository. Each section
 starts with its time in the video.
 
+Watch it on YouTube: https://youtu.be/qQx64DbZ01w
+
 The numbers in the video come from the run recorded for it. 
 
 ## 0:00 Welcome

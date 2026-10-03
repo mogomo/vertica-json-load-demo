@@ -127,9 +127,10 @@ phase2.sh / phase3.sh  (per run, per --parallel setting)
 - **Repeatable:** `COPY_TABLE` resets a table in milliseconds without copying data, so every
   run of every phase starts from exactly the same rows.
 - **The methods:** reasoning, SQL and pitfalls in [docs/METHODS.md](docs/METHODS.md).
-- **The video:** *MERGE 1 Million Changes into a 1-Billion-Row Table in Under a Second: Three
-  ways to update data in Vertica* walks through the three methods and the three phases in
-  13 minutes; its transcript: [docs/VIDEO_TRANSCRIPT.md](docs/VIDEO_TRANSCRIPT.md).
+- **The video:** [*MERGE 1 Million Changes into a 1-Billion-Row Table in Under a Second:
+  Three ways to update data in Vertica*](https://youtu.be/qQx64DbZ01w) walks through the
+  three methods and the three phases in 13 minutes; its transcript:
+  [docs/VIDEO_TRANSCRIPT.md](docs/VIDEO_TRANSCRIPT.md).
 
 ## Which method, when?
 
