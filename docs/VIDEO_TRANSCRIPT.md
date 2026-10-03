@@ -1,7 +1,9 @@
-# Three ways to update data in Vertica: video transcript
+# MERGE 1 Million Changes into a 1-Billion-Row Table in Under a Second
 
-The narration of the video *Three ways to update data in Vertica* (13 minutes), which walks
-through this repository. Each section starts with its time in the video.
+*Three ways to update data in Vertica*: the video transcript.
+
+The narration of the video (13 minutes), which walks through this repository. Each section
+starts with its time in the video.
 
 The numbers in the video come from the run recorded for it. 
 
