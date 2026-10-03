@@ -3,6 +3,11 @@
 Phase 1: one 1-billion-row table, three methods. Phases 2 and 3: ten tables, the JSON parsed once,
 10 parallel MERGEs.
 
+The timings in the phase 1, 2 and 3 tables are the scripts' own output: the RESULTS tables and
+step timers they print, all from the one run the video shows. The few other measurements in the
+text (the data generation, the one-session swap rebuild, the full check, the full Top-K read)
+come from separate runs on the same machine.
+
 ## Test system
 
 - Vertica 26.2 Community Edition, **single node**
@@ -30,7 +35,7 @@ Phase 1: one 1-billion-row table, three methods. Phases 2 and 3: ten tables, the
 
 ## Phase 1: 1 million changes into 1 billion rows
 
-`./phase1.sh --runs 3`, the run recorded for the video. Each method starts from the same
+`./phase1.sh --runs 3`; the table below is its RESULTS table. Each method starts from the same
 pristine table (reset with `COPY_TABLE`, not timed). The timer covers **parsing the JSON +
 loading + applying**.
 
@@ -124,8 +129,8 @@ Both phases do the same two timed steps:
    (phase 2: `WHERE file = '<table>'`; phase 3: `UNION ALL` of the table's slots), at most
    `--parallel` at a time.
 
-`./phase2.sh --parallel 10,5,1 --runs 3` and `./phase3.sh --parallel 10,5,1 --runs 3`, the run
-recorded for the video:
+`./phase2.sh --parallel 10,5,1 --runs 3` and `./phase3.sh --parallel 10,5,1 --runs 3`; the
+tables below are their RESULTS tables:
 
 <!-- phases23:begin -->
 | | MERGEs at a time | COPY (one parse) | 10 MERGEs | **Total** | Changes/s | Runs (total) |

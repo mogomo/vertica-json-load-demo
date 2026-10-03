@@ -50,9 +50,10 @@ Try it small first: `./generate.sh --rows 10M --changes 100K`, `./phase1.sh`,
 
 ## Results
 
-Measured on a single-node Vertica 26.2 (22 hardware threads, 61 GB RAM, one NVMe SSD) in the
-run recorded for the video, averages of 3 runs. Details and analysis:
-[docs/RESULTS.md](docs/RESULTS.md).
+Every number below is the scripts' own output: the RESULTS tables that `phase1.sh --runs 3`
+and `phase2.sh` / `phase3.sh --parallel 10,5,1 --runs 3` print (averages of 3 runs), in the
+one run the video shows. Measured on a single-node Vertica 26.2 (22 hardware threads, 61 GB
+RAM, one NVMe SSD). Details and analysis: [docs/RESULTS.md](docs/RESULTS.md).
 
 <!-- results:begin -->
 ### Phase 1: 1,000,000 JSON changes → 1,000,000,000-row table
