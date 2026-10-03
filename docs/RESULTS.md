@@ -30,15 +30,16 @@ Phase 1: one 1-billion-row table, three methods. Phases 2 and 3: ten tables, the
 
 ## Phase 1: 1 million changes into 1 billion rows
 
-`./phase1.sh --runs 3`. Each method starts from the same pristine table (reset with
-`COPY_TABLE`, not timed). The timer covers **parsing the JSON + loading + applying**.
+`./phase1.sh --runs 3`, the run recorded for the video. Each method starts from the same
+pristine table (reset with `COPY_TABLE`, not timed). The timer covers **parsing the JSON +
+loading + applying**.
 
 <!-- results:begin -->
 | Method | Parse + load JSON | Apply | **Total** | Rows/s | Runs | Delete vectors |
 |---|---:|---:|---:|---:|---|---:|
-| 1 Upsert (journal + Top-K LAP) | 2.12 s | – | **2.12 s** | 471K | 2.06 / 2.13 / 2.17 s | 0 |
-| 2 Staging + partition SWAP | 1.23 s | 14.66 s | **15.89 s** | 63K | 15.74 / 15.92 / 16.01 s | 0 |
-| 3 Optimized MERGE | 1.31 s | 0.89 s | **2.21 s** | 453K | 2.17 / 2.24 / 2.21 s | 500,000 |
+| 1 Upsert (journal + Top-K LAP) | 2.07 s | – | **2.07 s** | 483K | 2.04 / 2.07 / 2.10 s | 0 |
+| 2 Staging + partition SWAP | 1.22 s | 14.40 s | **15.61 s** | 64K | 15.55 / 15.57 / 15.73 s | 0 |
+| 3 Optimized MERGE | 1.27 s | 0.86 s | **2.13 s** | 469K | 2.10 / 2.16 / 2.14 s | 500,000 |
 <!-- results:end -->
 
 All three methods produced **identical data** in every run: 56,156,934 current rows in the
@@ -48,25 +49,25 @@ inserted) and found the same count and checksum everywhere.
 
 ### Where the time goes
 
-**Upsert (journal + Top-K LAP), 2.1 s.** The whole job is one COPY. It is ~0.9 s slower than
+**Upsert (journal + Top-K LAP), 2.1 s.** The whole job is one COPY. It is ~0.8 s slower than
 the plain COPY of the other methods because the journal is sorted by `(isn, change_ts)` and the
 COPY also maintains the Top-K projection. There is no apply step at all.
 
-**Optimized MERGE, 2.2 s.** COPY into the delta table 1.3 s, MERGE 0.9 s. `EXPLAIN` shows the
+**Optimized MERGE, 2.1 s.** COPY into the delta table 1.3 s, MERGE 0.86 s. `EXPLAIN` shows the
 optimized plan (`DML DELETE` + `DML INSERT` over a presorted merge join). The target has a
 billion rows, yet the MERGE takes under a second: its cost follows the 1 million changes,
 not the size of the table. It leaves 500,000 delete vectors behind (one per
 updated row) for the Tuple Mover to purge.
 
-**Staging + partition SWAP, 15.9 s.** A typical run:
+**Staging + partition SWAP, 15.6 s.** A typical run:
 
 | Step | Time |
 |---|---:|
-| COPY into the staging table | 1.20 s |
-| find the touched partitions (202511, 202512 and the new 202601) | 0.03 s |
-| create the stage table + ISN range of the rows to rebuild | 1.31 s |
-| rebuild the touched partitions: 56.2 M rows, 11 parallel sessions | 12.84 s |
-| `SWAP_PARTITIONS_BETWEEN_TABLES` | 0.04 s |
+| COPY into the staging table | 1.22 s |
+| find the touched partitions (202511, 202512 and the new 202601) | 0.04 s |
+| create the stage table + ISN range of the rows to rebuild | 1.27 s |
+| rebuild the touched partitions: 56.2 M rows, 11 parallel sessions | 13.02 s |
+| `SWAP_PARTITIONS_BETWEEN_TABLES` | 0.03 s |
 
 The method rewrites every row of the touched partitions, ~56 times more rows than it
 changes. With one session the rebuild took 44 s (total 45.6 s); 11 sessions bring it to 13 s.
@@ -87,7 +88,7 @@ In exchange, the fact table gets no delete vectors and the new data appears atom
 
 ### Repeatability
 
-The three runs differ by less than 0.3 s per method. `COPY_TABLE` resets a 1-billion-row
+The three runs differ by less than 0.2 s per method. `COPY_TABLE` resets a 1-billion-row
 table in 0.04–0.11 s and uses no extra disk: the method tables share the storage of
 `txn_base` / `txn_jrn_base`, and only the partitions a method rewrites take new space (a few
 GB). Note that `v_monitor.projection_storage` counts shared containers once per table, so it
@@ -123,32 +124,33 @@ Both phases do the same two timed steps:
    (phase 2: `WHERE file = '<table>'`; phase 3: `UNION ALL` of the table's slots), at most
    `--parallel` at a time.
 
-`./phase2.sh --parallel 10,5,1 --runs 3` and `./phase3.sh --parallel 10,5,1 --runs 3`:
+`./phase2.sh --parallel 10,5,1 --runs 3` and `./phase3.sh --parallel 10,5,1 --runs 3`, the run
+recorded for the video:
 
 <!-- phases23:begin -->
 | | MERGEs at a time | COPY (one parse) | 10 MERGEs | **Total** | Changes/s | Runs (total) |
 |---|---:|---:|---:|---:|---:|---|
-| **Phase 2** (flat records) | 10 | 30.10 s | 2.46 s | **32.56 s** | 307K | 32.73 / 32.13 / 32.81 s |
-| | 5 | 30.16 s | 2.98 s | 33.14 s | 302K | 33.33 / 33.13 / 32.97 s |
-| | 1 | 29.95 s | 8.65 s | 38.60 s | 259K | 39.09 / 38.17 / 38.55 s |
-| **Phase 3** (nested documents) | 10 | 20.90 s | 5.62 s | **26.51 s** | 377K | 27.07 / 26.50 / 25.96 s |
-| | 5 | 20.50 s | 6.30 s | 26.79 s | 373K | 26.82 / 26.85 / 26.71 s |
-| | 1 | 20.66 s | 14.80 s | 35.45 s | 282K | 35.35 / 35.30 / 35.70 s |
+| **Phase 2** (flat records) | 10 | 29.90 s | 2.45 s | **32.35 s** | 309K | 31.82 / 32.48 / 32.74 s |
+| | 5 | 29.82 s | 3.00 s | 32.82 s | 305K | 32.57 / 32.74 / 33.14 s |
+| | 1 | 30.06 s | 8.49 s | 38.55 s | 259K | 38.78 / 38.62 / 38.24 s |
+| **Phase 3** (nested documents) | 10 | 20.25 s | 5.63 s | **25.88 s** | 386K | 25.91 / 26.20 / 25.55 s |
+| | 5 | 20.41 s | 6.31 s | 26.72 s | 374K | 26.29 / 26.61 / 27.26 s |
+| | 1 | 20.39 s | 14.68 s | 35.07 s | 285K | 35.07 / 34.86 / 35.28 s |
 
 MERGE time per table, average of 3 runs (seconds):
 
 | Table | Rows | Phase 2: 10 / 5 / 1 at a time | Phase 3: 10 / 5 / 1 at a time |
 |---|---:|---:|---:|
-| txn | 1,000,000,000 | 1.92 / 1.32 / 0.93 | 5.28 / 3.62 / 2.51 |
-| customer | 60,000,000 | 2.46 / 2.17 / 1.40 | 5.61 / 4.77 / 1.89 |
-| account | 60,000,000 | 1.74 / 1.14 / 0.70 | 4.86 / 3.52 / 1.24 |
-| card | 60,000,000 | 1.78 / 1.22 / 0.76 | 5.03 / 3.53 / 1.31 |
-| loan | 60,000,000 | 1.69 / 1.15 / 0.71 | 4.89 / 3.50 / 1.26 |
-| payment | 60,000,000 | 2.06 / 1.41 / 0.98 | 5.30 / 2.32 / 1.41 |
-| policy | 60,000,000 | 1.79 / 1.12 / 0.75 | 5.09 / 2.14 / 1.28 |
-| claim | 60,000,000 | 1.73 / 1.06 / 0.70 | 4.58 / 2.09 / 1.20 |
-| employees | 60,000,000 | 2.02 / 1.39 / 0.98 | 5.25 / 2.32 / 1.44 |
-| vehicles | 60,000,000 | 1.72 / 0.81 / 0.69 | 4.86 / 1.52 / 1.22 |
+| txn | 1,000,000,000 | 1.92 / 1.38 / 0.93 | 5.27 / 3.61 / 2.50 |
+| customer | 60,000,000 | 2.44 / 2.17 / 1.32 | 5.62 / 4.81 / 1.85 |
+| account | 60,000,000 | 1.67 / 1.13 / 0.72 | 4.85 / 3.48 / 1.24 |
+| card | 60,000,000 | 1.77 / 1.24 / 0.76 | 5.11 / 3.53 / 1.26 |
+| loan | 60,000,000 | 1.73 / 1.13 / 0.71 | 4.76 / 3.48 / 1.26 |
+| payment | 60,000,000 | 2.02 / 1.42 / 0.94 | 5.34 / 2.32 / 1.43 |
+| policy | 60,000,000 | 1.76 / 1.15 / 0.75 | 4.93 / 2.20 / 1.26 |
+| claim | 60,000,000 | 1.70 / 1.06 / 0.70 | 4.78 / 2.12 / 1.18 |
+| employees | 60,000,000 | 1.96 / 1.37 / 0.93 | 5.28 / 2.30 / 1.42 |
+| vehicles | 60,000,000 | 1.69 / 0.82 / 0.68 | 4.93 / 1.49 / 1.23 |
 <!-- phases23:end -->
 
 Every one of the 18 runs passed the check on every table: base rows + 500,000 inserts,
@@ -157,11 +159,11 @@ checksum of the source rows in the staging table.
 
 ### What it means
 
-- **Parsing is the job.** The single COPY takes 79–92 % of the time; the 10 MERGEs into 1.54
+- **Parsing is the job.** The single COPY takes 78–92 % of the time; the 10 MERGEs into 1.54
   billion rows in all take 2.5 s (phase 2) and 5.6 s (phase 3) when they run in parallel.
 - **Parse once.** One COPY over all the files, then fan out inside the database. Ten COPYs over
   the same mixed files would each parse all 10M records.
-- **Nested documents parse faster than flat lines:** 20.9 s vs 30.1 s for the same 10M
+- **Nested documents parse faster than flat lines:** 20.3 s vs 29.9 s for the same 10M
   records. Phase 3 hands the parser 1M rows instead of 10M; the per-row cost (above all the
   ~160 mostly empty columns of the flat staging table) is paid ten times less often. For
   comparison, 1M records into one narrow table parse in 1.2 s (phase 1).
@@ -169,7 +171,7 @@ checksum of the source rows in the staging table.
   each MERGE reads a presorted slice and Vertica uses a merge join. Phase 3's `UNION ALL` of
   slots is not sorted on `isn`, so it uses a hash join. Both are the optimized
   `DML DELETE + DML INSERT` plan.
-- **10 or 5 at a time hardly differ** (32.6 vs 33.1 s, 26.5 vs 26.8 s); both beat one after the
+- **10 or 5 at a time hardly differ** (32.4 vs 32.8 s, 25.9 vs 26.7 s); both beat one after the
   other by 6–9 s. Ten parallel MERGEs are not "too heavy" for this machine.
 - **Fixed slots vs maps.** Phase 3 needs a maximum number of records per file in one
   transaction (2 here, like the maximum occurrences of an ADABAS periodic group). Unbounded

@@ -50,8 +50,9 @@ Try it small first: `./generate.sh --rows 10M --changes 100K`, `./phase1.sh`,
 
 ## Results
 
-Measured on a single-node Vertica 26.2 (22 hardware threads, 61 GB RAM, one NVMe SSD),
-averages of 3 runs. Details and analysis: [docs/RESULTS.md](docs/RESULTS.md).
+Measured on a single-node Vertica 26.2 (22 hardware threads, 61 GB RAM, one NVMe SSD) in the
+run recorded for the video, averages of 3 runs. Details and analysis:
+[docs/RESULTS.md](docs/RESULTS.md).
 
 <!-- results:begin -->
 ### Phase 1: 1,000,000 JSON changes → 1,000,000,000-row table
@@ -60,9 +61,9 @@ averages of 3 runs. Details and analysis: [docs/RESULTS.md](docs/RESULTS.md).
 
 | Method | Parse + load JSON | Apply | **Total** | Rows/s | Delete vectors |
 |---|---:|---:|---:|---:|---:|
-| 1 Upsert (journal + Top-K LAP) | 2.12 s | – | **2.12 s** | 471K | 0 |
-| 2 Staging + partition SWAP | 1.23 s | 14.66 s | **15.89 s** | 63K | 0 |
-| 3 Optimized MERGE | 1.31 s | 0.89 s | **2.21 s** | 453K | 500,000 |
+| 1 Upsert (journal + Top-K LAP) | 2.07 s | – | **2.07 s** | 483K | 0 |
+| 2 Staging + partition SWAP | 1.22 s | 14.40 s | **15.61 s** | 64K | 0 |
+| 3 Optimized MERGE | 1.27 s | 0.86 s | **2.13 s** | 469K | 500,000 |
 
 All three methods end with **identical data**: a `--full-check` compared all 1,000,500,000
 current rows (same count, same checksum).
@@ -74,14 +75,14 @@ tables of 60M rows. The JSON is parsed **once**, then 10 optimized MERGEs run in
 
 | | JSON shape | COPY (one parse) | 10 MERGEs, 10 at a time | **Total** | Changes/s |
 |---|---|---:|---:|---:|---:|
-| Phase 2 | 10M records, one per line, 10 tables mixed | 30.10 s | 2.46 s | **32.56 s** | 307K |
-| Phase 3 | 1M transactions, nested arrays of records | 20.90 s | 5.62 s | **26.51 s** | 377K |
+| Phase 2 | 10M records, one per line, 10 tables mixed | 29.90 s | 2.45 s | **32.35 s** | 309K |
+| Phase 3 | 1M transactions, nested arrays of records | 20.25 s | 5.63 s | **25.88 s** | 386K |
 
 | MERGEs at a time | Phase 2 total | Phase 3 total |
 |---|---:|---:|
-| 10 | **32.56 s** | **26.51 s** |
-| 5 | 33.14 s | 26.79 s |
-| 1 (one after the other) | 38.60 s | 35.45 s |
+| 10 | **32.35 s** | **25.88 s** |
+| 5 | 32.82 s | 26.72 s |
+| 1 (one after the other) | 38.55 s | 35.07 s |
 
 Every table passes its check in every run: base rows + 500,000 inserts, and the 1,000,000
 changed rows equal the JSON rows (count and checksum of all columns).
@@ -91,7 +92,7 @@ changed rows equal the JSON rows (count and checksum of all columns).
 are equally fast, and parsing the JSON is most of the work. When the files mix many tables,
 parse them **once** and fan out inside the database: ten MERGEs running in parallel take
 2.5–5.6 s for 10 million changes. Nested documents parse faster than the same records as
-flat lines (20.9 s vs 30.1 s), because the parser handles one tenth of the rows.
+flat lines (20.3 s vs 29.9 s), because the parser handles one tenth of the rows.
 
 ## What the scripts do
 
