@@ -1,5 +1,10 @@
 # JSON upserts into a 1-billion-row Vertica table: three methods, three phases
 
+<a href="https://youtu.be/qQx64DbZ01w"><img src="https://img.youtube.com/vi/qQx64DbZ01w/maxresdefault.jpg" width="640" alt="Video: MERGE 1 Million Changes into a 1-Billion-Row Table in Under a Second"></a>
+
+▶ **Watch the video (13 min):** [MERGE 1 Million Changes into a 1-Billion-Row Table in Under a
+Second](https://youtu.be/qQx64DbZ01w), three ways to update data in Vertica, run and measured.
+
 A mainframe ADABAS system sends its changes (CDC) as **hierarchical JSON**. Each batch holds
 **1 million** changed records per file: half **updates** of existing rows, half **inserts** of
 new rows. They must reach Vertica, where the biggest table has **1 billion rows**, as fast as
